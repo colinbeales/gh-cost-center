@@ -12,29 +12,33 @@ COMMON_HEADERS=(-H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Versio
 usage() {
   cat <<EOF
 Usage:
-  gh cost-center add-team -e <enterprise> -t <team> -c <cost-center> [--dry-run] [-y] [--verbose]
+  gh cost-center add-team -e <enterprise> -t <team> -c <cost-center> [OPTIONS]
 
 Description:
   Add members of an Enterprise Team to a Cost Center. This command will:
   1. Find the specified enterprise team by name
   2. Get all members of that team  
-  3. Find the specified cost center by name
+  3. Find the specified cost center by name (or create it if it doesn't exist)
   4. Add the team members to the cost center
 
 Flags:
-  -e, --enterprise     Enterprise slug (required)
-  -t, --team           Enterprise team name or slug (required)
-  -c, --cost-center    Cost center name (required)
-      --cost-center-id Cost center ID (overrides --cost-center)
-      --dry-run        Show actions without applying changes
-  -y, --yes            Skip confirmation prompts
-      --verbose        Extra logging output
-  -h, --help           Show this help message
+  -e, --enterprise         Enterprise slug (required)
+  -t, --team               Enterprise team name or slug (required)
+  -c, --cost-center        Cost center name (required)
+      --cost-center-id     Cost center ID (overrides --cost-center)
+      --create-cost-center Automatically create cost center if it doesn't exist
+      --force              Force mode: auto-create cost centers and skip all confirmations
+      --dry-run            Show actions without applying changes
+  -y, --yes                Skip confirmation prompts
+      --verbose            Extra logging output
+  -h, --help               Show this help message
 
 Examples:
   gh cost-center add-team -e myenterprise -t "Engineering Team" -c "Engineering Cost Center"
   gh cost-center add-team -e myenterprise -t engineering-team -c "Engineering Cost Center" --dry-run
   gh cost-center add-team -e myenterprise -t engineering-team --cost-center-id abc123 -y
+  gh cost-center add-team -e myenterprise -t "New Team" -c "New Cost Center" --create-cost-center
+  gh cost-center add-team -e myenterprise -t "Data Team" -c "Analytics Budget" --force --verbose
 
 Requirements:
   - GitHub Enterprise Cloud with Enterprise Teams and Cost Centers enabled
@@ -54,6 +58,70 @@ confirm() {
   [[ "$ans" == "y" || "$ans" == "Y" ]]
 }
 
+# Portable function to read lines into array (alternative to mapfile)
+read_lines_to_array() {
+  local array_name="$1"
+  local -a temp_array=()
+  local line
+  
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && temp_array+=("$line")
+  done
+  
+  # Use eval to assign to the named array
+  eval "${array_name}=(\"\${temp_array[@]}\")"
+}
+
+# Alternative approach using while loop for better compatibility
+populate_array_from_command() {
+  local array_name="$1"
+  local command="$2"
+  local -a temp_array=()
+  local line
+  
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && temp_array+=("$line")
+  done < <(eval "$command")
+  
+  # Use eval to assign to the named array, handle empty arrays
+  if [[ ${#temp_array[@]} -gt 0 ]]; then
+    eval "${array_name}=(\"\${temp_array[@]}\")"
+  else
+    eval "${array_name}=()"
+  fi
+}
+
+# Function to create a new cost center
+create_cost_center() {
+  local enterprise="$1"
+  local cost_center_name="$2"
+  
+  vlog "Creating cost center '$cost_center_name'..."
+  
+  local payload
+  payload=$(jq -nc --arg name "$cost_center_name" '{name: $name}')
+  
+  local response
+  if response=$(gh api "${COMMON_HEADERS[@]}" \
+    --method POST \
+    "/enterprises/${enterprise}/settings/billing/cost-centers" \
+    --input - <<<"$payload" 2>/dev/null); then
+    
+    # Extract the ID from the response
+    local new_id
+    new_id=$(echo "$response" | jq -r '.id // empty')
+    
+    if [[ -n "$new_id" && "$new_id" != "null" ]]; then
+      echo "$new_id"
+      return 0
+    else
+      return 1
+    fi
+  else
+    return 1
+  fi
+}
+
 # Parse arguments
 ENTERPRISE=""
 TEAM_INPUT=""
@@ -62,6 +130,8 @@ CC_ID=""
 DRY_RUN=""
 YES=""
 VERBOSE=""
+CREATE_CC=""
+FORCE=""
 
 cmd_add_team() {
   while [[ $# -gt 0 ]]; do
@@ -70,8 +140,10 @@ cmd_add_team() {
       -t|--team) TEAM_INPUT="$2"; shift 2;;
       -c|--cost-center) CC_NAME="$2"; shift 2;;
       --cost-center-id) CC_ID="$2"; shift 2;;
+      --create-cost-center) CREATE_CC="1"; shift;;
       --dry-run) DRY_RUN="1"; shift;;
       -y|--yes) YES="1"; shift;;
+      --force) FORCE="1"; YES="1"; CREATE_CC="1"; shift;;
       --verbose) VERBOSE="1"; shift;;
       -h|--help) usage; exit 0;;
       *) die "Unknown flag: $1";;
@@ -88,7 +160,11 @@ cmd_add_team() {
     die "Not authenticated with GitHub. Run 'gh auth login' first."
   fi
 
-  log "Starting to add enterprise team '$TEAM_INPUT' members to cost center..."
+  if [[ -n "$FORCE" ]]; then
+    log "Starting in FORCE mode - will auto-create cost centers and skip confirmations..."
+  else
+    log "Starting to add enterprise team '$TEAM_INPUT' members to cost center..."
+  fi
 
   # Step 1: Resolve cost center ID if only name provided
   if [[ -z "$CC_ID" ]]; then
@@ -101,8 +177,46 @@ cmd_add_team() {
     # Parse the costCenters array from the response
     CC_ID=$(echo "$COST_CENTERS_JSON" | jq -r --arg name "$CC_NAME" '.costCenters[]? | select(.name==$name) | .id' | head -n1)
     
-    [[ -z "$CC_ID" || "$CC_ID" == "null" ]] && die "Cost center named '$CC_NAME' not found in enterprise '$ENTERPRISE'."
-    vlog "Resolved cost center '$CC_NAME' -> ID $CC_ID"
+    if [[ -z "$CC_ID" || "$CC_ID" == "null" ]]; then
+      if [[ -n "$CREATE_CC" ]]; then
+        # Cost center not found, but we're allowed to create it
+        echo ""
+        echo "Cost center '$CC_NAME' not found in enterprise '$ENTERPRISE'."
+        
+        if [[ -n "$DRY_RUN" ]]; then
+          echo "[DRY RUN] Would create cost center '$CC_NAME'"
+          CC_ID="dry-run-cc-id"
+        else
+          echo ""
+          if [[ -n "$FORCE" ]]; then
+            echo "Force mode: Creating cost center '$CC_NAME'..."
+            vlog "Creating cost center '$CC_NAME'..."
+          elif confirm "Create new cost center '$CC_NAME'?"; then
+            vlog "Creating cost center '$CC_NAME'..."
+          else
+            die "Cost center creation cancelled. Cannot proceed without a cost center."
+          fi
+          
+          if CC_ID=$(create_cost_center "$ENTERPRISE" "$CC_NAME"); then
+            echo "✓ Created cost center '$CC_NAME' with ID: $CC_ID"
+            vlog "Successfully created cost center '$CC_NAME' -> ID $CC_ID"
+          else
+            die "Failed to create cost center '$CC_NAME'. Check permissions and try again."
+          fi
+        fi
+      else
+        echo ""
+        echo "Cost center '$CC_NAME' not found in enterprise '$ENTERPRISE'."
+        echo "Available options:"
+        echo "1. Use an existing cost center name"
+        echo "2. Add --create-cost-center flag to create it automatically"
+        echo "3. Add --force flag to auto-create and skip confirmations"
+        echo "4. Use --cost-center-id with an existing cost center ID"
+        die "Cost center not found. See options above."
+      fi
+    else
+      vlog "Resolved cost center '$CC_NAME' -> ID $CC_ID"
+    fi
   else
     vlog "Using provided cost center ID: $CC_ID"
   fi
@@ -140,7 +254,7 @@ cmd_add_team() {
     --paginate 2>/dev/null || die "Failed to fetch team members. Check team slug and permissions.")
   
   # Extract usernames from the member objects
-  mapfile -t TEAM_USERS < <(echo "$MEMBERS_JSON" | jq -r '.[].login // empty' | sort -u)
+  populate_array_from_command TEAM_USERS "echo '$MEMBERS_JSON' | jq -r '.[].login // empty' | sort -u"
   
   [[ ${#TEAM_USERS[@]} -eq 0 ]] && die "No members found for team '$TEAM_SLUG'."
   vlog "Found ${#TEAM_USERS[@]} team members"
@@ -148,12 +262,18 @@ cmd_add_team() {
   # Step 4: Get current cost center users to avoid duplicates
   vlog "Fetching current cost center users..."
   
-  CC_DETAILS_JSON=$(gh api "${COMMON_HEADERS[@]}" \
-    "/enterprises/${ENTERPRISE}/settings/billing/cost-centers/${CC_ID}" \
-    2>/dev/null || die "Failed to fetch cost center details. Check cost center ID and permissions.")
-  
-  # Extract current users from the resources array
-  mapfile -t CC_USERS < <(echo "$CC_DETAILS_JSON" | jq -r '.[].resources[]? | select(.type=="User") | .name // empty' | sort -u)
+  if [[ -n "$DRY_RUN" && "$CC_ID" == "dry-run-cc-id" ]]; then
+    # In dry-run mode with a new cost center, assume no existing users
+    vlog "Dry-run mode with new cost center - assuming no existing users"
+    CC_USERS=()
+  else
+    CC_DETAILS_JSON=$(gh api "${COMMON_HEADERS[@]}" \
+      "/enterprises/${ENTERPRISE}/settings/billing/cost-centers/${CC_ID}" \
+      2>/dev/null || die "Failed to fetch cost center details. Check cost center ID and permissions.")
+    
+    # Extract current users from the resources array - handle different JSON structures
+    populate_array_from_command CC_USERS "echo '$CC_DETAILS_JSON' | jq -r 'if type == \"array\" then .[].resources[]? else .resources[]? end | select(.type==\"User\") | .name // empty' | sort -u"
+  fi
   
   # Step 5: Compute users to add (those not already in cost center)
   TO_ADD=()
@@ -173,7 +293,11 @@ cmd_add_team() {
   echo "Summary:"
   echo "  Enterprise: $ENTERPRISE"
   echo "  Team: $TEAM_INPUT ($TEAM_SLUG)"
-  echo "  Cost Center ID: $CC_ID"
+  if [[ "$CC_ID" == "dry-run-cc-id" ]]; then
+    echo "  Cost Center: $CC_NAME (would be created)"
+  else
+    echo "  Cost Center: $CC_NAME ($CC_ID)"
+  fi
   echo "  Team members: ${#TEAM_USERS[@]}"
   echo "  Already in cost center: $((${#TEAM_USERS[@]} - ${#TO_ADD[@]}))"
   echo "  To add: ${#TO_ADD[@]}"
@@ -190,11 +314,19 @@ cmd_add_team() {
 
   if [[ -n "$DRY_RUN" ]]; then
     echo ""
-    echo "[DRY RUN] Would add ${#TO_ADD[@]} users to cost center. No changes made."
+    if [[ "$CC_ID" == "dry-run-cc-id" ]]; then
+      echo "[DRY RUN] Would create cost center '$CC_NAME' and add ${#TO_ADD[@]} users to it. No changes made."
+    else
+      echo "[DRY RUN] Would add ${#TO_ADD[@]} users to cost center. No changes made."
+    fi
     exit 0
   fi
 
   echo ""
+  if [[ "$CC_ID" == "dry-run-cc-id" ]]; then
+    die "Error: Cost center ID is invalid for actual execution. This should not happen."
+  fi
+  
   if ! confirm "Proceed to add ${#TO_ADD[@]} users to cost center '$CC_ID'?"; then
     echo "Operation cancelled."
     exit 0
