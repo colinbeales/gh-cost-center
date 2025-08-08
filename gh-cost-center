@@ -432,7 +432,7 @@ cmd_add_team() {
   fi
 
   # Step 9: Sync functionality - remove users not in team
-  if [[ "$SYNC_MODE" == "true" ]]; then
+  if [[ "$SYNC" == "1" ]]; then
     echo ""
     echo "=== Synchronizing cost center membership ==="
     
@@ -466,7 +466,7 @@ cmd_add_team() {
       else
         echo "Found ${#TO_REMOVE[@]} users to remove: ${TO_REMOVE[*]}"
         
-        if [[ "$FORCE_MODE" != "true" ]]; then
+        if [[ "$FORCE" != "1" ]]; then
           echo ""
           echo "These users will be REMOVED from cost center '$CC_NAME':"
           printf "  - %s\n" "${TO_REMOVE[@]}"
