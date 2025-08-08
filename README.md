@@ -1,5 +1,7 @@
 # gh-cost-center
 
+[![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)](CHANGELOG.md)
+
 A GitHub CLI extension to manage Enterprise Cost Centers and Team membership.
 
 ## Overview
@@ -9,6 +11,7 @@ This extension allows you to add members of GitHub Enterprise Teams to Cost Cent
 ## Features
 
 - ✅ Add all members of an Enterprise Team to a Cost Center
+- ✅ **Sync functionality** removes users from cost center who are not in the team (with `--sync`)
 - ✅ Automatic team and cost center resolution by name
 - ✅ **Auto-create cost centers** when they don't exist (with `--create-cost-center`)
 - ✅ **Force mode** for automation with `--force` flag (auto-creates + skips confirmations)
@@ -279,6 +282,13 @@ The extension is designed for automation scenarios:
 This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## Changelog
+
+### v1.2.0
+- **Added sync functionality** with `--sync` flag for bidirectional synchronization
+- Remove cost center users who are not in the enterprise team
+- Enhanced safety features with removal confirmations
+- Comprehensive sync documentation and examples
+- Fixed variable naming inconsistencies
 
 ### v1.1.0
 - **Added cost center auto-creation** with `--create-cost-center` flag
