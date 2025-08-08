@@ -10,6 +10,8 @@ This extension allows you to add members of GitHub Enterprise Teams to Cost Cent
 
 - ✅ Add all members of an Enterprise Team to a Cost Center
 - ✅ Automatic team and cost center resolution by name
+- ✅ **Auto-create cost centers** when they don't exist (with `--create-cost-center`)
+- ✅ **Force mode** for automation with `--force` flag (auto-creates + skips confirmations)
 - ✅ Dry-run mode to preview changes
 - ✅ Idempotent operations (won't duplicate existing users)
 - ✅ Batch processing for large teams
@@ -64,16 +66,18 @@ gh cost-center add-team -e myenterprise -t "Engineering Team" -c "Engineering Co
 gh cost-center add-team [options]
 
 Required:
-  -e, --enterprise     Enterprise slug
-  -t, --team          Enterprise team name or slug
-  -c, --cost-center   Cost center name
-      --cost-center-id Cost center ID (alternative to --cost-center)
+  -e, --enterprise         Enterprise slug
+  -t, --team              Enterprise team name or slug
+  -c, --cost-center       Cost center name
+      --cost-center-id    Cost center ID (alternative to --cost-center)
 
 Optional:
-      --dry-run       Show what would be changed without making changes
-  -y, --yes          Skip confirmation prompts
-      --verbose      Enable detailed logging
-  -h, --help         Show help message
+      --create-cost-center Automatically create cost center if it doesn't exist
+      --force             Force mode: auto-create cost centers and skip all confirmations
+      --dry-run           Show what would be changed without making changes
+  -y, --yes              Skip confirmation prompts
+      --verbose          Enable detailed logging
+  -h, --help             Show help message
 ```
 
 ### Examples
@@ -87,6 +91,12 @@ gh cost-center add-team -e myenterprise -t engineering-team -c "Engineering Budg
 
 # Preview changes without applying them
 gh cost-center add-team -e myenterprise -t "DevOps Team" -c "Infrastructure Budget" --dry-run
+
+# Create cost center if it doesn't exist (with confirmation)
+gh cost-center add-team -e myenterprise -t "New Team" -c "New Cost Center" --create-cost-center
+
+# Force mode: Auto-create cost center and skip all confirmations (perfect for automation)
+gh cost-center add-team -e myenterprise -t "Data Team" -c "Analytics Budget" --force --verbose
 
 # Skip confirmation prompts (useful for automation)
 gh cost-center add-team -e myenterprise -t "QA Team" -c "Quality Assurance Budget" -y
@@ -103,9 +113,10 @@ gh cost-center add-team -e myenterprise -t "Security Team" -c "Security Budget" 
 1. **Team Resolution**: Finds the enterprise team by name or slug
 2. **Member Retrieval**: Gets all members of the specified team
 3. **Cost Center Resolution**: Finds the cost center by name or uses provided ID
-4. **Duplicate Check**: Identifies team members not already in the cost center
-5. **Batch Addition**: Adds new users to the cost center in batches (up to 50 per request)
-6. **Result Summary**: Reports success/failure counts
+4. **Cost Center Creation**: Optionally creates cost center if it doesn't exist (with `--create-cost-center` or `--force`)
+5. **Duplicate Check**: Identifies team members not already in the cost center
+6. **Batch Addition**: Adds new users to the cost center in batches (up to 50 per request)
+7. **Result Summary**: Reports success/failure counts
 
 ## API Endpoints Used
 
@@ -185,6 +196,7 @@ gh extension remove cost-center
 **"Cost center not found"**
 - Use the exact cost center name as it appears in billing settings
 - Consider using `--cost-center-id` instead
+- Use `--create-cost-center` or `--force` to create it automatically
 
 ### Getting Help
 
@@ -197,11 +209,44 @@ For GitHub Enterprise Teams or Billing API issues:
 - Contact GitHub Enterprise Support
 - Check the GitHub Enterprise documentation
 
+## Automation & CI/CD
+
+The extension is designed for automation scenarios:
+
+### GitHub Actions Example
+```yaml
+- name: Add team to cost center
+  run: |
+    gh extension install <username>/gh-cost-center
+    gh cost-center add-team \
+      -e "${{ vars.ENTERPRISE }}" \
+      -t "${{ vars.TEAM_NAME }}" \
+      -c "${{ vars.COST_CENTER }}" \
+      --force --verbose
+  env:
+    GH_TOKEN: ${{ secrets.ENTERPRISE_TOKEN }}
+```
+
+### Automation Best Practices
+- Use `--force` for fully automated runs (creates cost centers and skips confirmations)
+- Use `--dry-run` first to validate configuration
+- Use `--verbose` for detailed logging in CI/CD
+- Store enterprise details in environment variables or secrets
+- Use dedicated service accounts with minimal required permissions
+
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## Changelog
+
+### v1.1.0
+- **Added cost center auto-creation** with `--create-cost-center` flag
+- **Added force mode** with `--force` flag for full automation
+- Enhanced error handling with helpful suggestions
+- Improved dry-run mode with cost center creation preview
+- Added automation and CI/CD documentation
+- Better confirmation handling and user experience
 
 ### v1.0.0
 - Initial release
