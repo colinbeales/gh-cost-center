@@ -29,6 +29,9 @@ Advanced example that adds multiple teams to different cost centers.
 ### example-with-validation.sh
 Example with validation checks and error handling.
 
+### example-sync.sh
+Synchronization example that ensures cost center membership matches team membership exactly.
+
 ## Running Examples
 
 Make the scripts executable and run them:

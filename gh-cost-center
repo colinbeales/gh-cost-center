@@ -19,7 +19,8 @@ Description:
   1. Find the specified enterprise team by name
   2. Get all members of that team  
   3. Find the specified cost center by name (or create it if it doesn't exist)
-  4. Add the team members to the cost center
+  4. Optionally remove users from cost center who are not in the team (--sync)
+  5. Add the team members to the cost center
 
 Flags:
   -e, --enterprise         Enterprise slug (required)
@@ -27,6 +28,7 @@ Flags:
   -c, --cost-center        Cost center name (required)
       --cost-center-id     Cost center ID (overrides --cost-center)
       --create-cost-center Automatically create cost center if it doesn't exist
+      --sync               Remove users from cost center who are not in the team
       --force              Force mode: auto-create cost centers and skip all confirmations
       --dry-run            Show actions without applying changes
   -y, --yes                Skip confirmation prompts
@@ -39,6 +41,7 @@ Examples:
   gh cost-center add-team -e myenterprise -t engineering-team --cost-center-id abc123 -y
   gh cost-center add-team -e myenterprise -t "New Team" -c "New Cost Center" --create-cost-center
   gh cost-center add-team -e myenterprise -t "Data Team" -c "Analytics Budget" --force --verbose
+  gh cost-center add-team -e myenterprise -t "DevOps Team" -c "Infrastructure Budget" --sync
 
 Requirements:
   - GitHub Enterprise Cloud with Enterprise Teams and Cost Centers enabled
@@ -122,6 +125,59 @@ create_cost_center() {
   fi
 }
 
+# Function to remove users from a cost center
+remove_users_from_cost_center() {
+  local enterprise="$1"
+  local cost_center_id="$2"
+  shift 2
+  local users_to_remove=("$@")
+  
+  if [[ ${#users_to_remove[@]} -eq 0 ]]; then
+    return 0
+  fi
+  
+  vlog "Removing ${#users_to_remove[@]} users from cost center..."
+  
+  # The API accepts up to 50 resources per request
+  local batch_size=50
+  local removed=0
+  local failures=0
+  
+  for ((i=0; i<${#users_to_remove[@]}; i+=batch_size)); do
+    # Get batch of users
+    local batch=("${users_to_remove[@]:i:batch_size}")
+    local current_batch_size=${#batch[@]}
+    
+    vlog "Removing batch of $current_batch_size users: ${batch[*]}"
+    
+    # Create JSON payload for this batch
+    local payload
+    payload=$(printf '%s\n' "${batch[@]}" | jq -R . | jq -s '{users: .}')
+    
+    if gh api "${COMMON_HEADERS[@]}" \
+      --method DELETE \
+      "/enterprises/${enterprise}/settings/billing/cost-centers/${cost_center_id}/resource" \
+      --input - <<<"$payload" >/dev/null 2>&1; then
+      removed=$((removed + current_batch_size))
+      vlog "Successfully removed batch of $current_batch_size users"
+    else
+      failures=$((failures + current_batch_size))
+      echo "Failed to remove batch: ${batch[*]}" >&2
+    fi
+  done
+  
+  if [[ $removed -gt 0 ]]; then
+    echo "✓ Removed $removed users from cost center"
+  fi
+  
+  if [[ $failures -gt 0 ]]; then
+    echo "✗ Failed to remove $failures users" >&2
+    return 1
+  fi
+  
+  return 0
+}
+
 # Parse arguments
 ENTERPRISE=""
 TEAM_INPUT=""
@@ -132,6 +188,7 @@ YES=""
 VERBOSE=""
 CREATE_CC=""
 FORCE=""
+SYNC=""
 
 cmd_add_team() {
   while [[ $# -gt 0 ]]; do
@@ -141,6 +198,7 @@ cmd_add_team() {
       -c|--cost-center) CC_NAME="$2"; shift 2;;
       --cost-center-id) CC_ID="$2"; shift 2;;
       --create-cost-center) CREATE_CC="1"; shift;;
+      --sync) SYNC="1"; shift;;
       --dry-run) DRY_RUN="1"; shift;;
       -y|--yes) YES="1"; shift;;
       --force) FORCE="1"; YES="1"; CREATE_CC="1"; shift;;
@@ -372,7 +430,62 @@ cmd_add_team() {
     echo "✗ Failed to add $failures users" >&2
     exit 2
   fi
+
+  # Step 9: Sync functionality - remove users not in team
+  if [[ "$SYNC_MODE" == "true" ]]; then
+    echo ""
+    echo "=== Synchronizing cost center membership ==="
+    
+    # Get current cost center users
+    vlog "Getting current cost center users..."
+    CC_USERS=()
+    read_array_from_json CC_USERS "gh api ${COMMON_HEADERS[*]} \"/enterprises/${ENTERPRISE}/settings/billing/cost-centers/${CC_ID}/resource\" | jq -r '.resources[]?.users[]? // empty'"
+    
+    if [[ ${#CC_USERS[@]} -eq 0 ]]; then
+      echo "✓ Cost center has no users to sync"
+    else
+      echo "Found ${#CC_USERS[@]} users in cost center: ${CC_USERS[*]}"
+      
+      # Find users to remove (in cost center but not in team)
+      TO_REMOVE=()
+      for cc_user in "${CC_USERS[@]}"; do
+        found=false
+        for team_user in "${TEAM_USERS[@]}"; do
+          if [[ "$cc_user" == "$team_user" ]]; then
+            found=true
+            break
+          fi
+        done
+        if [[ "$found" == "false" ]]; then
+          TO_REMOVE+=("$cc_user")
+        fi
+      done
+      
+      if [[ ${#TO_REMOVE[@]} -eq 0 ]]; then
+        echo "✓ No users need to be removed - cost center is already synchronized"
+      else
+        echo "Found ${#TO_REMOVE[@]} users to remove: ${TO_REMOVE[*]}"
+        
+        if [[ "$FORCE_MODE" != "true" ]]; then
+          echo ""
+          echo "These users will be REMOVED from cost center '$CC_NAME':"
+          printf "  - %s\n" "${TO_REMOVE[@]}"
+          echo ""
+          if ! confirm "Continue with removal?"; then
+            echo "Removal cancelled."
+            exit 0
+          fi
+        fi
+        
+        if ! remove_users_from_cost_center "$ENTERPRISE" "$CC_ID" "${TO_REMOVE[@]}"; then
+          echo "Failed to remove users from cost center" >&2
+          exit 1
+        fi
+      fi
+    fi
+  fi
   
+  echo ""
   echo "Operation completed successfully!"
   exit 0
 }

@@ -73,6 +73,7 @@ Required:
 
 Optional:
       --create-cost-center Automatically create cost center if it doesn't exist
+      --sync              Remove users from cost center who are not in the team
       --force             Force mode: auto-create cost centers and skip all confirmations
       --dry-run           Show what would be changed without making changes
   -y, --yes              Skip confirmation prompts
@@ -104,6 +105,9 @@ gh cost-center add-team -e myenterprise -t "QA Team" -c "Quality Assurance Budge
 # Use cost center ID instead of name (more precise)
 gh cost-center add-team -e myenterprise -t "Data Team" --cost-center-id "abc123-def456"
 
+# Synchronize cost center membership with team (removes users not in team)
+gh cost-center add-team -e myenterprise -t "DevOps Team" -c "Infrastructure Budget" --sync
+
 # Enable verbose logging for troubleshooting
 gh cost-center add-team -e myenterprise -t "Security Team" -c "Security Budget" --verbose
 ```
@@ -116,7 +120,40 @@ gh cost-center add-team -e myenterprise -t "Security Team" -c "Security Budget" 
 4. **Cost Center Creation**: Optionally creates cost center if it doesn't exist (with `--create-cost-center` or `--force`)
 5. **Duplicate Check**: Identifies team members not already in the cost center
 6. **Batch Addition**: Adds new users to the cost center in batches (up to 50 per request)
-7. **Result Summary**: Reports success/failure counts
+7. **Synchronization**: Optionally removes users from cost center who are not in the team (with `--sync`)
+8. **Result Summary**: Reports success/failure counts
+
+## Sync Functionality
+
+The `--sync` flag provides bidirectional synchronization between enterprise teams and cost centers:
+
+### What Sync Does
+- **Adds missing users**: Team members not in the cost center are added
+- **Removes extra users**: Cost center users not in the team are removed
+- **Maintains alignment**: Ensures cost center membership exactly matches team membership
+
+### When to Use Sync
+- **Team changes**: When team membership has changed and you want cost centers to reflect current membership
+- **Clean-up**: Remove former team members from cost center budgets
+- **Compliance**: Ensure only current team members have access to cost center resources
+- **Automation**: Regular sync jobs to maintain alignment
+
+### Sync Safety Features
+- **Confirmation prompts**: Shows exactly which users will be removed (unless `--force` is used)
+- **Dry run support**: Use `--dry-run` to preview sync actions
+- **Verbose logging**: Use `--verbose` to see detailed sync operations
+- **Batch operations**: Handles large user lists efficiently
+
+```bash
+# Preview sync changes
+gh cost-center add-team -e myenterprise -t "DevOps Team" -c "Infrastructure" --sync --dry-run
+
+# Sync with confirmation
+gh cost-center add-team -e myenterprise -t "DevOps Team" -c "Infrastructure" --sync
+
+# Automated sync (no prompts)
+gh cost-center add-team -e myenterprise -t "DevOps Team" -c "Infrastructure" --sync --force
+```
 
 ## API Endpoints Used
 
@@ -130,7 +167,10 @@ This extension uses the following GitHub Enterprise APIs:
 ### Enterprise Billing API
 - `GET /enterprises/{enterprise}/settings/billing/cost-centers` - List cost centers
 - `GET /enterprises/{enterprise}/settings/billing/cost-centers/{id}` - Get cost center details
+- `GET /enterprises/{enterprise}/settings/billing/cost-centers/{id}/resource` - Get cost center users
+- `POST /enterprises/{enterprise}/settings/billing/cost-centers` - Create cost center
 - `POST /enterprises/{enterprise}/settings/billing/cost-centers/{id}/resource` - Add users to cost center
+- `DELETE /enterprises/{enterprise}/settings/billing/cost-centers/{id}/resource` - Remove users from cost center
 
 ## Error Handling
 
@@ -145,10 +185,10 @@ The extension includes comprehensive error handling for common scenarios:
 
 ## Limitations
 
-- Maximum 50 users can be added per API request (automatically handled with batching)
+- Maximum 50 users can be added/removed per API request (automatically handled with batching)
 - Requires GitHub Enterprise Cloud with Enhanced Billing Platform
 - Enterprise Teams API is currently in Early Access
-- Only supports adding users (not removing)
+- User removal only available via sync functionality (--sync flag)
 
 ## Development
 
