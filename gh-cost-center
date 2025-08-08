@@ -1,35 +1,259 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-echo "Hello gh-cost-center!"
+# GitHub CLI extension to add Enterprise Team members to Cost Centers
+# Author: GitHub Copilot
+# Version: 1.0.0
 
-# Snippets to help get started:
+# Configurable default headers
+API_VERSION="2022-11-28"
+COMMON_HEADERS=(-H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: ${API_VERSION}")
 
-# Determine if an executable is in the PATH
-# if ! type -p ruby >/dev/null; then
-#   echo "Ruby not found on the system" >&2
-#   exit 1
-# fi
+usage() {
+  cat <<EOF
+Usage:
+  gh cost-center add-team -e <enterprise> -t <team> -c <cost-center> [--dry-run] [-y] [--verbose]
 
-# Pass arguments through to another command
-# gh issue list "$@" -R cli/cli
+Description:
+  Add members of an Enterprise Team to a Cost Center. This command will:
+  1. Find the specified enterprise team by name
+  2. Get all members of that team  
+  3. Find the specified cost center by name
+  4. Add the team members to the cost center
 
-# Using the gh api command to retrieve and format information
-# QUERY='
-#   query($endCursor: String) {
-#     viewer {
-#       repositories(first: 100, after: $endCursor) {
-#         nodes {
-#           nameWithOwner
-#           stargazerCount
-#         }
-#       }
-#     }
-#   }
-# '
-# TEMPLATE='
-#   {{- range $repo := .data.viewer.repositories.nodes -}}
-#     {{- printf "name: %s - stargazers: %v\n" $repo.nameWithOwner $repo.stargazerCount -}}
-#   {{- end -}}
-# '
-# exec gh api graphql -f query="${QUERY}" --paginate --template="${TEMPLATE}"
+Flags:
+  -e, --enterprise     Enterprise slug (required)
+  -t, --team           Enterprise team name or slug (required)
+  -c, --cost-center    Cost center name (required)
+      --cost-center-id Cost center ID (overrides --cost-center)
+      --dry-run        Show actions without applying changes
+  -y, --yes            Skip confirmation prompts
+      --verbose        Extra logging output
+  -h, --help           Show this help message
+
+Examples:
+  gh cost-center add-team -e myenterprise -t "Engineering Team" -c "Engineering Cost Center"
+  gh cost-center add-team -e myenterprise -t engineering-team -c "Engineering Cost Center" --dry-run
+  gh cost-center add-team -e myenterprise -t engineering-team --cost-center-id abc123 -y
+
+Requirements:
+  - GitHub Enterprise Cloud with Enterprise Teams and Cost Centers enabled
+  - Enterprise admin permissions
+  - Personal access token with manage_billing:enterprise scope
+
+EOF
+}
+
+log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
+vlog() { [[ -n "${VERBOSE:-}" ]] && log "$@"; }
+die() { echo "Error: $*" >&2; exit 1; }
+
+confirm() {
+  [[ -n "${YES:-}" ]] && return 0
+  read -r -p "$1 [y/N]: " ans
+  [[ "$ans" == "y" || "$ans" == "Y" ]]
+}
+
+# Parse arguments
+ENTERPRISE=""
+TEAM_INPUT=""
+CC_NAME=""
+CC_ID=""
+DRY_RUN=""
+YES=""
+VERBOSE=""
+
+cmd_add_team() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -e|--enterprise) ENTERPRISE="$2"; shift 2;;
+      -t|--team) TEAM_INPUT="$2"; shift 2;;
+      -c|--cost-center) CC_NAME="$2"; shift 2;;
+      --cost-center-id) CC_ID="$2"; shift 2;;
+      --dry-run) DRY_RUN="1"; shift;;
+      -y|--yes) YES="1"; shift;;
+      --verbose) VERBOSE="1"; shift;;
+      -h|--help) usage; exit 0;;
+      *) die "Unknown flag: $1";;
+    esac
+  done
+
+  # Validate required arguments
+  [[ -z "$ENTERPRISE" ]] && die "Enterprise slug is required (-e/--enterprise)"
+  [[ -z "$TEAM_INPUT" ]] && die "Team name is required (-t/--team)"
+  [[ -z "$CC_NAME" && -z "$CC_ID" ]] && die "Cost center name (-c/--cost-center) or ID (--cost-center-id) is required"
+
+  # Check if gh is authenticated
+  if ! gh auth status >/dev/null 2>&1; then
+    die "Not authenticated with GitHub. Run 'gh auth login' first."
+  fi
+
+  log "Starting to add enterprise team '$TEAM_INPUT' members to cost center..."
+
+  # Step 1: Resolve cost center ID if only name provided
+  if [[ -z "$CC_ID" ]]; then
+    vlog "Fetching cost centers for enterprise '$ENTERPRISE'..."
+    
+    COST_CENTERS_JSON=$(gh api "${COMMON_HEADERS[@]}" \
+      "/enterprises/${ENTERPRISE}/settings/billing/cost-centers" \
+      --paginate 2>/dev/null || die "Failed to fetch cost centers. Check enterprise permissions and name.")
+    
+    # Parse the costCenters array from the response
+    CC_ID=$(echo "$COST_CENTERS_JSON" | jq -r --arg name "$CC_NAME" '.costCenters[]? | select(.name==$name) | .id' | head -n1)
+    
+    [[ -z "$CC_ID" || "$CC_ID" == "null" ]] && die "Cost center named '$CC_NAME' not found in enterprise '$ENTERPRISE'."
+    vlog "Resolved cost center '$CC_NAME' -> ID $CC_ID"
+  else
+    vlog "Using provided cost center ID: $CC_ID"
+  fi
+
+  # Step 2: Resolve team slug/ID from name
+  vlog "Resolving team '$TEAM_INPUT'..."
+  
+  TEAMS_JSON=$(gh api "${COMMON_HEADERS[@]}" \
+    "/enterprises/${ENTERPRISE}/teams?per_page=100" \
+    --paginate 2>/dev/null || die "Failed to fetch teams. Check enterprise permissions and early access to Enterprise Teams API.")
+  
+  # Try to find team by exact name or slug match
+  TEAM_SLUG=$(echo "$TEAMS_JSON" | jq -r --arg q "$TEAM_INPUT" '
+    .[] | select((.slug==$q) or (.name==$q)) | .slug
+  ' | head -n1)
+
+  if [[ -z "$TEAM_SLUG" || "$TEAM_SLUG" == "null" ]]; then
+    # Fallback: treat input as slug directly and test if it exists
+    TEAM_SLUG="$TEAM_INPUT"
+    vlog "Team not found by name, trying as slug: $TEAM_SLUG"
+    
+    # Test if team exists by trying to get it
+    if ! gh api "${COMMON_HEADERS[@]}" "/enterprises/${ENTERPRISE}/teams/${TEAM_SLUG}" >/dev/null 2>&1; then
+      die "Team '$TEAM_INPUT' not found in enterprise '$ENTERPRISE'. Check the team name or slug."
+    fi
+  else
+    vlog "Resolved team '$TEAM_INPUT' -> slug '$TEAM_SLUG'"
+  fi
+
+  # Step 3: Fetch team members
+  vlog "Fetching members for team '$TEAM_SLUG'..."
+  
+  MEMBERS_JSON=$(gh api "${COMMON_HEADERS[@]}" \
+    "/enterprises/${ENTERPRISE}/teams/${TEAM_SLUG}/memberships?per_page=100" \
+    --paginate 2>/dev/null || die "Failed to fetch team members. Check team slug and permissions.")
+  
+  # Extract usernames from the member objects
+  mapfile -t TEAM_USERS < <(echo "$MEMBERS_JSON" | jq -r '.[].login // empty' | sort -u)
+  
+  [[ ${#TEAM_USERS[@]} -eq 0 ]] && die "No members found for team '$TEAM_SLUG'."
+  vlog "Found ${#TEAM_USERS[@]} team members"
+
+  # Step 4: Get current cost center users to avoid duplicates
+  vlog "Fetching current cost center users..."
+  
+  CC_DETAILS_JSON=$(gh api "${COMMON_HEADERS[@]}" \
+    "/enterprises/${ENTERPRISE}/settings/billing/cost-centers/${CC_ID}" \
+    2>/dev/null || die "Failed to fetch cost center details. Check cost center ID and permissions.")
+  
+  # Extract current users from the resources array
+  mapfile -t CC_USERS < <(echo "$CC_DETAILS_JSON" | jq -r '.[].resources[]? | select(.type=="User") | .name // empty' | sort -u)
+  
+  # Step 5: Compute users to add (those not already in cost center)
+  TO_ADD=()
+  if [[ ${#CC_USERS[@]} -gt 0 ]]; then
+    CC_SET=$(printf "%s\n" "${CC_USERS[@]}" | sort -u)
+    for user in "${TEAM_USERS[@]}"; do
+      if ! echo "$CC_SET" | grep -qxF "$user"; then
+        TO_ADD+=("$user")
+      fi
+    done
+  else
+    TO_ADD=("${TEAM_USERS[@]}")
+  fi
+
+  # Step 6: Display summary and confirm
+  echo ""
+  echo "Summary:"
+  echo "  Enterprise: $ENTERPRISE"
+  echo "  Team: $TEAM_INPUT ($TEAM_SLUG)"
+  echo "  Cost Center ID: $CC_ID"
+  echo "  Team members: ${#TEAM_USERS[@]}"
+  echo "  Already in cost center: $((${#TEAM_USERS[@]} - ${#TO_ADD[@]}))"
+  echo "  To add: ${#TO_ADD[@]}"
+  
+  if [[ ${#TO_ADD[@]} -eq 0 ]]; then
+    echo ""
+    echo "✓ All team members are already in the cost center. Nothing to do."
+    exit 0
+  fi
+
+  echo ""
+  echo "Users to add:"
+  printf "  %s\n" "${TO_ADD[@]}"
+
+  if [[ -n "$DRY_RUN" ]]; then
+    echo ""
+    echo "[DRY RUN] Would add ${#TO_ADD[@]} users to cost center. No changes made."
+    exit 0
+  fi
+
+  echo ""
+  if ! confirm "Proceed to add ${#TO_ADD[@]} users to cost center '$CC_ID'?"; then
+    echo "Operation cancelled."
+    exit 0
+  fi
+
+  # Step 7: Add users to cost center
+  log "Adding users to cost center..."
+  
+  # The API accepts up to 50 resources per request, so we'll batch if needed
+  BATCH_SIZE=50
+  added=0
+  failures=0
+  
+  for ((i=0; i<${#TO_ADD[@]}; i+=BATCH_SIZE)); do
+    # Get batch of users
+    batch=("${TO_ADD[@]:i:BATCH_SIZE}")
+    batch_size=${#batch[@]}
+    
+    vlog "Adding batch of $batch_size users: ${batch[*]}"
+    
+    # Create JSON payload for this batch
+    payload=$(printf '%s\n' "${batch[@]}" | jq -R . | jq -s '{users: .}')
+    
+    if gh api "${COMMON_HEADERS[@]}" \
+      --method POST \
+      "/enterprises/${ENTERPRISE}/settings/billing/cost-centers/${CC_ID}/resource" \
+      --input - <<<"$payload" >/dev/null 2>&1; then
+      added=$((added + batch_size))
+      vlog "Successfully added batch of $batch_size users"
+    else
+      failures=$((failures + batch_size))
+      echo "Failed to add batch: ${batch[*]}" >&2
+    fi
+  done
+
+  # Step 8: Report results
+  echo ""
+  if [[ $added -gt 0 ]]; then
+    echo "✓ Successfully added $added users to cost center '$CC_ID'"
+  fi
+  
+  if [[ $failures -gt 0 ]]; then
+    echo "✗ Failed to add $failures users" >&2
+    exit 2
+  fi
+  
+  echo "Operation completed successfully!"
+  exit 0
+}
+
+main() {
+  sub="${1:-}"
+  if [[ $# -gt 0 ]]; then shift; fi
+  
+  case "$sub" in
+    add-team) cmd_add_team "$@";;
+    -h|--help|help|"") usage; exit 0;;
+    *) die "Unknown subcommand: $sub. Use 'gh cost-center --help' for usage.";;
+  esac
+}
+
+main "$@"
