@@ -362,73 +362,83 @@ cmd_add_team() {
   
   if [[ ${#TO_ADD[@]} -eq 0 ]]; then
     echo ""
-    echo "✓ All team members are already in the cost center. Nothing to do."
-    exit 0
-  fi
-
-  echo ""
-  echo "Users to add:"
-  printf "  %s\n" "${TO_ADD[@]}"
-
-  if [[ -n "$DRY_RUN" ]]; then
+    echo "✓ All team members are already in the cost center."
+    
+    # Skip adding users but continue to sync if requested
+    if [[ "$SYNC" != "1" ]]; then
+      echo "Nothing to do."
+      exit 0
+    fi
+  else
     echo ""
-    if [[ "$CC_ID" == "dry-run-cc-id" ]]; then
-      echo "[DRY RUN] Would create cost center '$CC_NAME' and add ${#TO_ADD[@]} users to it. No changes made."
+    echo "Users to add:"
+    printf "  %s\n" "${TO_ADD[@]}"
+
+    if [[ -n "$DRY_RUN" ]]; then
+      echo ""
+      if [[ "$CC_ID" == "dry-run-cc-id" ]]; then
+        echo "[DRY RUN] Would create cost center '$CC_NAME' and add ${#TO_ADD[@]} users to it."
+      else
+        echo "[DRY RUN] Would add ${#TO_ADD[@]} users to cost center."
+      fi
+      
+      # Continue to sync if requested, even in dry-run mode
+      if [[ "$SYNC" != "1" ]]; then
+        echo "No changes made."
+        exit 0
+      fi
     else
-      echo "[DRY RUN] Would add ${#TO_ADD[@]} users to cost center. No changes made."
+      echo ""
+      if [[ "$CC_ID" == "dry-run-cc-id" ]]; then
+        die "Error: Cost center ID is invalid for actual execution. This should not happen."
+      fi
+      
+      if ! confirm "Proceed to add ${#TO_ADD[@]} users to cost center '$CC_ID'?"; then
+        echo "Operation cancelled."
+        exit 0
+      fi
+
+      # Step 7: Add users to cost center
+      log "Adding users to cost center..."
+      
+      # The API accepts up to 50 resources per request, so we'll batch if needed
+      BATCH_SIZE=50
+      added=0
+      failures=0
+      
+      for ((i=0; i<${#TO_ADD[@]}; i+=BATCH_SIZE)); do
+      # Get batch of users
+      batch=("${TO_ADD[@]:i:BATCH_SIZE}")
+      batch_size=${#batch[@]}
+      
+      vlog "Adding batch of $batch_size users: ${batch[*]}"
+      
+      # Create JSON payload for this batch
+      payload=$(printf '%s\n' "${batch[@]}" | jq -R . | jq -s '{users: .}')
+      
+      if gh api "${COMMON_HEADERS[@]}" \
+        --method POST \
+        "/enterprises/${ENTERPRISE}/settings/billing/cost-centers/${CC_ID}/resource" \
+        --input - <<<"$payload" >/dev/null 2>&1; then
+        added=$((added + batch_size))
+        vlog "Successfully added batch of $batch_size users"
+      else
+        failures=$((failures + batch_size))
+        echo "Failed to add batch: ${batch[*]}" >&2
+      fi
+    done
+
+    # Step 8: Report results
+    echo ""
+    if [[ $added -gt 0 ]]; then
+      echo "✓ Successfully added $added users to cost center '$CC_ID'"
     fi
-    exit 0
-  fi
-
-  echo ""
-  if [[ "$CC_ID" == "dry-run-cc-id" ]]; then
-    die "Error: Cost center ID is invalid for actual execution. This should not happen."
-  fi
-  
-  if ! confirm "Proceed to add ${#TO_ADD[@]} users to cost center '$CC_ID'?"; then
-    echo "Operation cancelled."
-    exit 0
-  fi
-
-  # Step 7: Add users to cost center
-  log "Adding users to cost center..."
-  
-  # The API accepts up to 50 resources per request, so we'll batch if needed
-  BATCH_SIZE=50
-  added=0
-  failures=0
-  
-  for ((i=0; i<${#TO_ADD[@]}; i+=BATCH_SIZE)); do
-    # Get batch of users
-    batch=("${TO_ADD[@]:i:BATCH_SIZE}")
-    batch_size=${#batch[@]}
     
-    vlog "Adding batch of $batch_size users: ${batch[*]}"
-    
-    # Create JSON payload for this batch
-    payload=$(printf '%s\n' "${batch[@]}" | jq -R . | jq -s '{users: .}')
-    
-    if gh api "${COMMON_HEADERS[@]}" \
-      --method POST \
-      "/enterprises/${ENTERPRISE}/settings/billing/cost-centers/${CC_ID}/resource" \
-      --input - <<<"$payload" >/dev/null 2>&1; then
-      added=$((added + batch_size))
-      vlog "Successfully added batch of $batch_size users"
-    else
-      failures=$((failures + batch_size))
-      echo "Failed to add batch: ${batch[*]}" >&2
+    if [[ $failures -gt 0 ]]; then
+      echo "✗ Failed to add $failures users" >&2
+      exit 2
     fi
-  done
-
-  # Step 8: Report results
-  echo ""
-  if [[ $added -gt 0 ]]; then
-    echo "✓ Successfully added $added users to cost center '$CC_ID'"
-  fi
-  
-  if [[ $failures -gt 0 ]]; then
-    echo "✗ Failed to add $failures users" >&2
-    exit 2
+    fi
   fi
 
   # Step 9: Sync functionality - remove users not in team
@@ -436,19 +446,24 @@ cmd_add_team() {
     echo ""
     echo "=== Synchronizing cost center membership ==="
     
-    # Get current cost center users
+    # Get current cost center users (reuse the already fetched data)
     vlog "Getting current cost center users..."
-    CC_USERS=()
-    read_array_from_json CC_USERS "gh api ${COMMON_HEADERS[*]} \"/enterprises/${ENTERPRISE}/settings/billing/cost-centers/${CC_ID}/resource\" | jq -r '.resources[]?.users[]? // empty'"
+    if [[ "$CC_ID" == "dry-run-cc-id" ]]; then
+      SYNC_CC_USERS=()
+      vlog "Dry-run mode - assuming no existing users for sync"
+    else
+      # Reuse the CC_DETAILS_JSON that was already fetched
+      populate_array_from_command SYNC_CC_USERS "echo '$CC_DETAILS_JSON' | jq -r 'if type == \"array\" then .[].resources[]? else .resources[]? end | select(.type==\"User\") | .name // empty' | sort -u"
+    fi
     
-    if [[ ${#CC_USERS[@]} -eq 0 ]]; then
+    if [[ ${#SYNC_CC_USERS[@]} -eq 0 ]]; then
       echo "✓ Cost center has no users to sync"
     else
-      echo "Found ${#CC_USERS[@]} users in cost center: ${CC_USERS[*]}"
+      echo "Found ${#SYNC_CC_USERS[@]} users in cost center: ${SYNC_CC_USERS[*]}"
       
       # Find users to remove (in cost center but not in team)
       TO_REMOVE=()
-      for cc_user in "${CC_USERS[@]}"; do
+      for cc_user in "${SYNC_CC_USERS[@]}"; do
         found=false
         for team_user in "${TEAM_USERS[@]}"; do
           if [[ "$cc_user" == "$team_user" ]]; then
@@ -466,20 +481,27 @@ cmd_add_team() {
       else
         echo "Found ${#TO_REMOVE[@]} users to remove: ${TO_REMOVE[*]}"
         
-        if [[ "$FORCE" != "1" ]]; then
+        if [[ -n "$DRY_RUN" ]]; then
           echo ""
-          echo "These users will be REMOVED from cost center '$CC_NAME':"
+          echo "[DRY RUN] Would remove ${#TO_REMOVE[@]} users from cost center. No changes made."
+          echo "Users that would be removed:"
           printf "  - %s\n" "${TO_REMOVE[@]}"
-          echo ""
-          if ! confirm "Continue with removal?"; then
-            echo "Removal cancelled."
-            exit 0
+        else
+          if [[ "$FORCE" != "1" ]]; then
+            echo ""
+            echo "These users will be REMOVED from cost center '$CC_NAME':"
+            printf "  - %s\n" "${TO_REMOVE[@]}"
+            echo ""
+            if ! confirm "Continue with removal?"; then
+              echo "Removal cancelled."
+              exit 0
+            fi
           fi
-        fi
-        
-        if ! remove_users_from_cost_center "$ENTERPRISE" "$CC_ID" "${TO_REMOVE[@]}"; then
-          echo "Failed to remove users from cost center" >&2
-          exit 1
+          
+          if ! remove_users_from_cost_center "$ENTERPRISE" "$CC_ID" "${TO_REMOVE[@]}"; then
+            echo "Failed to remove users from cost center" >&2
+            exit 1
+          fi
         fi
       fi
     fi
