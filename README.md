@@ -1,16 +1,17 @@
 # gh-cost-center
 
-[![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.3.0-blue.svg)](CHANGELOG.md)
 
 A GitHub CLI extension to manage Enterprise Cost Centers and Team membership.
 
 ## Overview
 
-This extension allows you to add members of GitHub Enterprise Teams to Cost Centers automatically. It's designed for GitHub Enterprise Cloud customers who use both Enterprise Teams and Cost Centers for billing management.
+This extension allows you to add members of GitHub Teams (both Enterprise Teams and Organization Teams) to Cost Centers automatically. It's designed for GitHub Enterprise Cloud customers who use Cost Centers for billing management.
 
 ## Features
 
-- ✅ Add all members of an Enterprise Team to a Cost Center
+- ✅ Add all members of an **Enterprise Team** to a Cost Center
+- ✅ Add all members of an **Organization Team** to a Cost Center (new in v1.3.0)
 - ✅ **Sync functionality** removes users from cost center who are not in the team (with `--sync`)
 - ✅ Automatic team and cost center resolution by name
 - ✅ **Auto-create cost centers** when they don't exist (with `--create-cost-center`)
@@ -35,15 +36,17 @@ gh extension install .
 
 ### Requirements
 - GitHub Enterprise Cloud account
-- Access to Enterprise Teams (Early Access feature)
 - Access to Cost Centers (Enhanced billing platform)
-- Enterprise admin permissions
+- Enterprise admin permissions for billing management
+- For **Enterprise Teams**: Early access to Enterprise Teams API
+- For **Organization Teams**: Organization member permissions with `read:org` scope
 - GitHub CLI authenticated with appropriate permissions
 
 ### Authentication
 Your GitHub CLI must be authenticated with a token that has:
 - `manage_billing:enterprise` scope
-- Enterprise admin permissions
+- For Enterprise Teams: Enterprise admin permissions
+- For Organization Teams: `read:org` scope
 
 ```bash
 # Check authentication status
@@ -63,6 +66,12 @@ Add all members of an enterprise team to a cost center:
 gh cost-center add-team -e myenterprise -t "Engineering Team" -c "Engineering Cost Center"
 ```
 
+Add all members of an organization team to a cost center:
+
+```bash
+gh cost-center add-team -e myenterprise --org myorg -t "engineering" -c "Engineering Cost Center"
+```
+
 ### Options
 
 ```bash
@@ -70,11 +79,12 @@ gh cost-center add-team [options]
 
 Required:
   -e, --enterprise         Enterprise slug
-  -t, --team              Enterprise team name or slug
+  -t, --team              Team name or slug
   -c, --cost-center       Cost center name
       --cost-center-id    Cost center ID (alternative to --cost-center)
 
 Optional:
+      --org               Organization name (use org teams instead of enterprise teams)
       --create-cost-center Automatically create cost center if it doesn't exist
       --sync              Remove users from cost center who are not in the team
       --force             Force mode: auto-create cost centers and skip all confirmations
@@ -86,6 +96,7 @@ Optional:
 
 ### Examples
 
+#### Enterprise Teams
 ```bash
 # Basic usage with team and cost center names
 gh cost-center add-team -e myenterprise -t "Engineering Team" -c "Engineering Budget"
@@ -113,6 +124,21 @@ gh cost-center add-team -e myenterprise -t "DevOps Team" -c "Infrastructure Budg
 
 # Enable verbose logging for troubleshooting
 gh cost-center add-team -e myenterprise -t "Security Team" -c "Security Budget" --verbose
+```
+
+#### Organization Teams
+```bash
+# Basic usage with organization team
+gh cost-center add-team -e myenterprise --org myorg -t "engineering" -c "Engineering Budget"
+
+# Organization team with sync functionality
+gh cost-center add-team -e myenterprise --org myorg -t "data-science" -c "Analytics Budget" --sync
+
+# Force mode with organization team
+gh cost-center add-team -e myenterprise --org myorg -t "devops" -c "Infrastructure Budget" --force
+
+# Dry run with organization team
+gh cost-center add-team -e myenterprise --org myorg -t "security" -c "Security Budget" --dry-run --verbose
 ```
 
 ## How It Works

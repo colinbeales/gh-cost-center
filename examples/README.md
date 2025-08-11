@@ -32,6 +32,9 @@ Example with validation checks and error handling.
 ### example-sync.sh
 Synchronization example that ensures cost center membership matches team membership exactly.
 
+### example-org-teams.sh
+Organization teams example showing how to use GitHub organization teams instead of enterprise teams.
+
 ## Running Examples
 
 Make the scripts executable and run them:

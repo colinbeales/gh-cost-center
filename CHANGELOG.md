@@ -5,6 +5,29 @@ All notable changes to the gh-cost-center extension will be documented in this f
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2025-08-11
+
+### Added
+- **Organization Teams support** with `--org` parameter for using GitHub organization teams instead of enterprise teams
+- New API endpoints integration for GitHub Teams API (`/orgs/{org}/teams` and `/orgs/{org}/teams/{team_slug}/members`)
+- `resolve_org_team()` function to find organization teams by name or slug
+- `get_org_team_members()` function to fetch organization team members
+- `resolve_enterprise_team()` and `get_enterprise_team_members()` functions to refactor existing enterprise team logic
+- Enhanced team type detection in summary output showing "[org team]" vs "[enterprise team]"
+- Updated help text and examples for both enterprise and organization team usage
+- Updated documentation with organization teams examples and requirements
+
+### Changed
+- Refactored team resolution logic into separate functions for enterprise and organization teams
+- Enhanced error messages to differentiate between enterprise and organization team failures
+- Updated usage examples to show both enterprise and organization team workflows
+- Improved requirements documentation to clarify permissions needed for each team type
+
+### Technical Details
+- Organization teams use standard GitHub REST API endpoints (no early access required)
+- Maintains backward compatibility with existing enterprise team functionality
+- Uses same cost center management logic for both team types
+
 ## [1.2.0] - 2025-08-08
 
 ### Added

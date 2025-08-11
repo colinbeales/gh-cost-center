@@ -3,7 +3,7 @@ set -euo pipefail
 
 # GitHub CLI extension to add Enterprise Team members to Cost Centers
 # Author: GitHub Copilot
-# Version: 1.0.0
+# Version: 1.3.0
 
 # Configurable default headers
 API_VERSION="2022-11-28"
@@ -13,10 +13,11 @@ usage() {
   cat <<EOF
 Usage:
   gh cost-center add-team -e <enterprise> -t <team> -c <cost-center> [OPTIONS]
+  gh cost-center add-team -e <enterprise> --org <organization> -t <team> -c <cost-center> [OPTIONS]
 
 Description:
-  Add members of an Enterprise Team to a Cost Center. This command will:
-  1. Find the specified enterprise team by name
+  Add members of a Team to a Cost Center. This command will:
+  1. Find the specified team by name (Enterprise Team or Organization Team)
   2. Get all members of that team  
   3. Find the specified cost center by name (or create it if it doesn't exist)
   4. Optionally remove users from cost center who are not in the team (--sync)
@@ -24,7 +25,8 @@ Description:
 
 Flags:
   -e, --enterprise         Enterprise slug (required)
-  -t, --team               Enterprise team name or slug (required)
+      --org                Organization name (use org teams instead of enterprise teams)
+  -t, --team               Team name or slug (required)
   -c, --cost-center        Cost center name (required)
       --cost-center-id     Cost center ID (overrides --cost-center)
       --create-cost-center Automatically create cost center if it doesn't exist
@@ -36,6 +38,7 @@ Flags:
   -h, --help               Show this help message
 
 Examples:
+  # Enterprise Teams
   gh cost-center add-team -e myenterprise -t "Engineering Team" -c "Engineering Cost Center"
   gh cost-center add-team -e myenterprise -t engineering-team -c "Engineering Cost Center" --dry-run
   gh cost-center add-team -e myenterprise -t engineering-team --cost-center-id abc123 -y
@@ -43,9 +46,14 @@ Examples:
   gh cost-center add-team -e myenterprise -t "Data Team" -c "Analytics Budget" --force --verbose
   gh cost-center add-team -e myenterprise -t "DevOps Team" -c "Infrastructure Budget" --sync
 
+  # Organization Teams  
+  gh cost-center add-team -e myenterprise --org myorg -t "engineering" -c "Engineering Cost Center"
+  gh cost-center add-team -e myenterprise --org myorg -t "data-science" -c "Analytics Budget" --sync
+
 Requirements:
-  - GitHub Enterprise Cloud with Enterprise Teams and Cost Centers enabled
-  - Enterprise admin permissions
+  - GitHub Enterprise Cloud with Cost Centers enabled
+  - For Enterprise Teams: Enterprise admin permissions and early access to Enterprise Teams API
+  - For Organization Teams: Organization member permissions with read:org scope
   - Personal access token with manage_billing:enterprise scope
 
 EOF
@@ -178,8 +186,128 @@ remove_users_from_cost_center() {
   return 0
 }
 
+# Function to get organization team members
+get_org_team_members() {
+  local org="$1"
+  local team_slug="$2"
+  
+  vlog "Fetching organization team members for '$team_slug' in org '$org'..."
+  
+  local members_json
+  if members_json=$(gh api "${COMMON_HEADERS[@]}" \
+    "/orgs/${org}/teams/${team_slug}/members?per_page=100" \
+    --paginate 2>/dev/null); then
+    
+    # Extract usernames from the member objects
+    populate_array_from_command TEAM_USERS "echo '$members_json' | jq -r '.[].login // empty' | sort -u"
+    
+    if [[ ${#TEAM_USERS[@]} -eq 0 ]]; then
+      return 1
+    fi
+    
+    vlog "Found ${#TEAM_USERS[@]} team members"
+    return 0
+  else
+    return 1
+  fi
+}
+
+# Function to resolve organization team
+resolve_org_team() {
+  local org="$1"
+  local team_input="$2"
+  
+  vlog "Resolving organization team '$team_input' in org '$org'..."
+  
+  # First try to get the team directly by slug
+  if gh api "${COMMON_HEADERS[@]}" "/orgs/${org}/teams/${team_input}" >/dev/null 2>&1; then
+    echo "$team_input"
+    return 0
+  fi
+  
+  # If that fails, list all teams and look for name or slug match
+  local teams_json
+  if teams_json=$(gh api "${COMMON_HEADERS[@]}" \
+    "/orgs/${org}/teams?per_page=100" \
+    --paginate 2>/dev/null); then
+    
+    # Try to find team by exact name or slug match
+    local team_slug
+    team_slug=$(echo "$teams_json" | jq -r --arg q "$team_input" '
+      .[] | select((.slug==$q) or (.name==$q)) | .slug
+    ' | head -n1)
+    
+    if [[ -n "$team_slug" && "$team_slug" != "null" ]]; then
+      echo "$team_slug"
+      return 0
+    fi
+  fi
+  
+  return 1
+}
+
+# Function to get enterprise team members (existing logic)
+get_enterprise_team_members() {
+  local enterprise="$1"
+  local team_slug="$2"
+  
+  vlog "Fetching enterprise team members for '$team_slug'..."
+  
+  local members_json
+  if members_json=$(gh api "${COMMON_HEADERS[@]}" \
+    "/enterprises/${enterprise}/teams/${team_slug}/memberships?per_page=100" \
+    --paginate 2>/dev/null); then
+    
+    # Extract usernames from the member objects
+    populate_array_from_command TEAM_USERS "echo '$members_json' | jq -r '.[].login // empty' | sort -u"
+    
+    if [[ ${#TEAM_USERS[@]} -eq 0 ]]; then
+      return 1
+    fi
+    
+    vlog "Found ${#TEAM_USERS[@]} team members"
+    return 0
+  else
+    return 1
+  fi
+}
+
+# Function to resolve enterprise team (existing logic)
+resolve_enterprise_team() {
+  local enterprise="$1"
+  local team_input="$2"
+  
+  vlog "Resolving enterprise team '$team_input'..."
+  
+  local teams_json
+  if teams_json=$(gh api "${COMMON_HEADERS[@]}" \
+    "/enterprises/${enterprise}/teams?per_page=100" \
+    --paginate 2>/dev/null); then
+    
+    # Try to find team by exact name or slug match
+    local team_slug
+    team_slug=$(echo "$teams_json" | jq -r --arg q "$team_input" '
+      .[] | select((.slug==$q) or (.name==$q)) | .slug
+    ' | head -n1)
+
+    if [[ -n "$team_slug" && "$team_slug" != "null" ]]; then
+      echo "$team_slug"
+      return 0
+    fi
+  fi
+  
+  # Fallback: treat input as slug directly and test if it exists
+  if gh api "${COMMON_HEADERS[@]}" "/enterprises/${enterprise}/teams/${team_input}" >/dev/null 2>&1; then
+    echo "$team_input"
+    return 0
+  fi
+  
+  return 1
+}
+
 # Parse arguments
 ENTERPRISE=""
+ORG=""
 TEAM_INPUT=""
 CC_NAME=""
 CC_ID=""
@@ -194,6 +322,7 @@ cmd_add_team() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -e|--enterprise) ENTERPRISE="$2"; shift 2;;
+      --org) ORG="$2"; shift 2;;
       -t|--team) TEAM_INPUT="$2"; shift 2;;
       -c|--cost-center) CC_NAME="$2"; shift 2;;
       --cost-center-id) CC_ID="$2"; shift 2;;
@@ -221,7 +350,11 @@ cmd_add_team() {
   if [[ -n "$FORCE" ]]; then
     log "Starting in FORCE mode - will auto-create cost centers and skip confirmations..."
   else
-    log "Starting to add enterprise team '$TEAM_INPUT' members to cost center..."
+    if [[ -n "$ORG" ]]; then
+      log "Starting to add organization team '$TEAM_INPUT' members from org '$ORG' to cost center..."
+    else
+      log "Starting to add enterprise team '$TEAM_INPUT' members to cost center..."
+    fi
   fi
 
   # Step 1: Resolve cost center ID if only name provided
@@ -279,45 +412,38 @@ cmd_add_team() {
     vlog "Using provided cost center ID: $CC_ID"
   fi
 
-  # Step 2: Resolve team slug/ID from name
-  vlog "Resolving team '$TEAM_INPUT'..."
-  
-  TEAMS_JSON=$(gh api "${COMMON_HEADERS[@]}" \
-    "/enterprises/${ENTERPRISE}/teams?per_page=100" \
-    --paginate 2>/dev/null || die "Failed to fetch teams. Check enterprise permissions and early access to Enterprise Teams API.")
-  
-  # Try to find team by exact name or slug match
-  TEAM_SLUG=$(echo "$TEAMS_JSON" | jq -r --arg q "$TEAM_INPUT" '
-    .[] | select((.slug==$q) or (.name==$q)) | .slug
-  ' | head -n1)
-
-  if [[ -z "$TEAM_SLUG" || "$TEAM_SLUG" == "null" ]]; then
-    # Fallback: treat input as slug directly and test if it exists
-    TEAM_SLUG="$TEAM_INPUT"
-    vlog "Team not found by name, trying as slug: $TEAM_SLUG"
+  # Step 2: Resolve team slug/ID and fetch members
+  if [[ -n "$ORG" ]]; then
+    # Organization team flow
+    vlog "Using organization teams from org '$ORG'..."
     
-    # Test if team exists by trying to get it
-    if ! gh api "${COMMON_HEADERS[@]}" "/enterprises/${ENTERPRISE}/teams/${TEAM_SLUG}" >/dev/null 2>&1; then
-      die "Team '$TEAM_INPUT' not found in enterprise '$ENTERPRISE'. Check the team name or slug."
+    if TEAM_SLUG=$(resolve_org_team "$ORG" "$TEAM_INPUT"); then
+      vlog "Resolved organization team '$TEAM_INPUT' -> slug '$TEAM_SLUG'"
+    else
+      die "Organization team '$TEAM_INPUT' not found in org '$ORG'. Check the team name or slug and organization permissions."
+    fi
+    
+    if ! get_org_team_members "$ORG" "$TEAM_SLUG"; then
+      die "Failed to fetch members for organization team '$TEAM_SLUG'. Check team slug and permissions."
     fi
   else
-    vlog "Resolved team '$TEAM_INPUT' -> slug '$TEAM_SLUG'"
+    # Enterprise team flow (existing logic)
+    vlog "Using enterprise teams..."
+    
+    if TEAM_SLUG=$(resolve_enterprise_team "$ENTERPRISE" "$TEAM_INPUT"); then
+      vlog "Resolved enterprise team '$TEAM_INPUT' -> slug '$TEAM_SLUG'"
+    else
+      die "Enterprise team '$TEAM_INPUT' not found in enterprise '$ENTERPRISE'. Check the team name or slug and enterprise permissions."
+    fi
+    
+    if ! get_enterprise_team_members "$ENTERPRISE" "$TEAM_SLUG"; then
+      die "Failed to fetch members for enterprise team '$TEAM_SLUG'. Check team slug and permissions."
+    fi
   fi
 
-  # Step 3: Fetch team members
-  vlog "Fetching members for team '$TEAM_SLUG'..."
-  
-  MEMBERS_JSON=$(gh api "${COMMON_HEADERS[@]}" \
-    "/enterprises/${ENTERPRISE}/teams/${TEAM_SLUG}/memberships?per_page=100" \
-    --paginate 2>/dev/null || die "Failed to fetch team members. Check team slug and permissions.")
-  
-  # Extract usernames from the member objects
-  populate_array_from_command TEAM_USERS "echo '$MEMBERS_JSON' | jq -r '.[].login // empty' | sort -u"
-  
   [[ ${#TEAM_USERS[@]} -eq 0 ]] && die "No members found for team '$TEAM_SLUG'."
-  vlog "Found ${#TEAM_USERS[@]} team members"
 
-  # Step 4: Get current cost center users to avoid duplicates
+  # Step 3: Get current cost center users to avoid duplicates
   vlog "Fetching current cost center users..."
   
   if [[ -n "$DRY_RUN" && "$CC_ID" == "dry-run-cc-id" ]]; then
@@ -333,7 +459,7 @@ cmd_add_team() {
     populate_array_from_command CC_USERS "echo '$CC_DETAILS_JSON' | jq -r 'if type == \"array\" then .[].resources[]? else .resources[]? end | select(.type==\"User\") | .name // empty' | sort -u"
   fi
   
-  # Step 5: Compute users to add (those not already in cost center)
+  # Step 4: Compute users to add (those not already in cost center)
   TO_ADD=()
   if [[ ${#CC_USERS[@]} -gt 0 ]]; then
     CC_SET=$(printf "%s\n" "${CC_USERS[@]}" | sort -u)
@@ -346,11 +472,16 @@ cmd_add_team() {
     TO_ADD=("${TEAM_USERS[@]}")
   fi
 
-  # Step 6: Display summary and confirm
+  # Step 5: Display summary and confirm
   echo ""
   echo "Summary:"
   echo "  Enterprise: $ENTERPRISE"
-  echo "  Team: $TEAM_INPUT ($TEAM_SLUG)"
+  if [[ -n "$ORG" ]]; then
+    echo "  Organization: $ORG"
+    echo "  Team: $TEAM_INPUT ($TEAM_SLUG) [org team]"
+  else
+    echo "  Team: $TEAM_INPUT ($TEAM_SLUG) [enterprise team]"
+  fi
   if [[ "$CC_ID" == "dry-run-cc-id" ]]; then
     echo "  Cost Center: $CC_NAME (would be created)"
   else
@@ -398,7 +529,7 @@ cmd_add_team() {
         exit 0
       fi
 
-      # Step 7: Add users to cost center
+      # Step 6: Add users to cost center
       log "Adding users to cost center..."
       
       # The API accepts up to 50 resources per request, so we'll batch if needed
@@ -428,7 +559,7 @@ cmd_add_team() {
       fi
     done
 
-    # Step 8: Report results
+    # Step 7: Report results
     echo ""
     if [[ $added -gt 0 ]]; then
       echo "✓ Successfully added $added users to cost center '$CC_ID'"
@@ -441,7 +572,7 @@ cmd_add_team() {
     fi
   fi
 
-  # Step 9: Sync functionality - remove users not in team
+  # Step 8: Sync functionality - remove users not in team
   if [[ "$SYNC" == "1" ]]; then
     echo ""
     echo "=== Synchronizing cost center membership ==="
