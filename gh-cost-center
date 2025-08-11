@@ -1,657 +1,157 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# GitHub CLI extension to add Enterprise Team members to Cost Centers
+# GitHub CLI extension to add Team members to Cost Centers
 # Author: GitHub Copilot
 # Version: 1.3.0
 
-# Configurable default headers
-API_VERSION="2022-11-28"
-COMMON_HEADERS=(-H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: ${API_VERSION}")
+# Get script directory for module loading
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-usage() {
-  cat <<EOF
-Usage:
-  gh cost-center add-team -e <enterprise> -t <team> -c <cost-center> [OPTIONS]
-  gh cost-center add-team -e <enterprise> --org <organization> -t <team> -c <cost-center> [OPTIONS]
+# Source all library modules
+# shellcheck source=lib/log.sh
+. "$SCRIPT_DIR/lib/log.sh"
+# shellcheck source=lib/json.sh
+. "$SCRIPT_DIR/lib/json.sh"
+# shellcheck source=lib/api.sh
+. "$SCRIPT_DIR/lib/api.sh"
+# shellcheck source=lib/args.sh
+. "$SCRIPT_DIR/lib/args.sh"
+# shellcheck source=lib/team.sh
+. "$SCRIPT_DIR/lib/team.sh"
+# shellcheck source=lib/cost_center.sh
+. "$SCRIPT_DIR/lib/cost_center.sh"
 
-Description:
-  Add members of a Team to a Cost Center. This command will:
-  1. Find the specified team by name (Enterprise Team or Organization Team)
-  2. Get all members of that team  
-  3. Find the specified cost center by name (or create it if it doesn't exist)
-  4. Optionally remove users from cost center who are not in the team (--sync)
-  5. Add the team members to the cost center
-
-Flags:
-  -e, --enterprise         Enterprise slug (required)
-      --org                Organization name (use org teams instead of enterprise teams)
-  -t, --team               Team name or slug (required)
-  -c, --cost-center        Cost center name (required)
-      --cost-center-id     Cost center ID (overrides --cost-center)
-      --create-cost-center Automatically create cost center if it doesn't exist
-      --sync               Remove users from cost center who are not in the team
-      --force              Force mode: auto-create cost centers and skip all confirmations
-      --dry-run            Show actions without applying changes
-  -y, --yes                Skip confirmation prompts
-      --verbose            Extra logging output
-  -h, --help               Show this help message
-
-Examples:
-  # Enterprise Teams
-  gh cost-center add-team -e myenterprise -t "Engineering Team" -c "Engineering Cost Center"
-  gh cost-center add-team -e myenterprise -t engineering-team -c "Engineering Cost Center" --dry-run
-  gh cost-center add-team -e myenterprise -t engineering-team --cost-center-id abc123 -y
-  gh cost-center add-team -e myenterprise -t "New Team" -c "New Cost Center" --create-cost-center
-  gh cost-center add-team -e myenterprise -t "Data Team" -c "Analytics Budget" --force --verbose
-  gh cost-center add-team -e myenterprise -t "DevOps Team" -c "Infrastructure Budget" --sync
-
-  # Organization Teams  
-  gh cost-center add-team -e myenterprise --org myorg -t "engineering" -c "Engineering Cost Center"
-  gh cost-center add-team -e myenterprise --org myorg -t "data-science" -c "Analytics Budget" --sync
-
-Requirements:
-  - GitHub Enterprise Cloud with Cost Centers enabled
-  - For Enterprise Teams: Enterprise admin permissions and early access to Enterprise Teams API
-  - For Organization Teams: Organization member permissions with read:org scope
-  - Personal access token with manage_billing:enterprise scope
-
-EOF
-}
-
-log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
-vlog() { [[ -n "${VERBOSE:-}" ]] && log "$@"; }
-die() { echo "Error: $*" >&2; exit 1; }
-
-confirm() {
-  [[ -n "${YES:-}" ]] && return 0
-  read -r -p "$1 [y/N]: " ans
-  [[ "$ans" == "y" || "$ans" == "Y" ]]
-}
-
-# Portable function to read lines into array (alternative to mapfile)
-read_lines_to_array() {
-  local array_name="$1"
-  local -a temp_array=()
-  local line
-  
-  while IFS= read -r line; do
-    [[ -n "$line" ]] && temp_array+=("$line")
-  done
-  
-  # Use eval to assign to the named array
-  eval "${array_name}=(\"\${temp_array[@]}\")"
-}
-
-# Alternative approach using while loop for better compatibility
-populate_array_from_command() {
-  local array_name="$1"
-  local command="$2"
-  local -a temp_array=()
-  local line
-  
-  while IFS= read -r line; do
-    [[ -n "$line" ]] && temp_array+=("$line")
-  done < <(eval "$command")
-  
-  # Use eval to assign to the named array, handle empty arrays
-  if [[ ${#temp_array[@]} -gt 0 ]]; then
-    eval "${array_name}=(\"\${temp_array[@]}\")"
-  else
-    eval "${array_name}=()"
-  fi
-}
-
-# Function to create a new cost center
-create_cost_center() {
-  local enterprise="$1"
-  local cost_center_name="$2"
-  
-  vlog "Creating cost center '$cost_center_name'..."
-  
-  local payload
-  payload=$(jq -nc --arg name "$cost_center_name" '{name: $name}')
-  
-  local response
-  if response=$(gh api "${COMMON_HEADERS[@]}" \
-    --method POST \
-    "/enterprises/${enterprise}/settings/billing/cost-centers" \
-    --input - <<<"$payload" 2>/dev/null); then
-    
-    # Extract the ID from the response
-    local new_id
-    new_id=$(echo "$response" | jq -r '.id // empty')
-    
-    if [[ -n "$new_id" && "$new_id" != "null" ]]; then
-      echo "$new_id"
-      return 0
-    else
-      return 1
-    fi
-  else
-    return 1
-  fi
-}
-
-# Function to remove users from a cost center
-remove_users_from_cost_center() {
-  local enterprise="$1"
-  local cost_center_id="$2"
-  shift 2
-  local users_to_remove=("$@")
-  
-  if [[ ${#users_to_remove[@]} -eq 0 ]]; then
-    return 0
-  fi
-  
-  vlog "Removing ${#users_to_remove[@]} users from cost center..."
-  
-  # The API accepts up to 50 resources per request
-  local batch_size=50
-  local removed=0
-  local failures=0
-  
-  for ((i=0; i<${#users_to_remove[@]}; i+=batch_size)); do
-    # Get batch of users
-    local batch=("${users_to_remove[@]:i:batch_size}")
-    local current_batch_size=${#batch[@]}
-    
-    vlog "Removing batch of $current_batch_size users: ${batch[*]}"
-    
-    # Create JSON payload for this batch
-    local payload
-    payload=$(printf '%s\n' "${batch[@]}" | jq -R . | jq -s '{users: .}')
-    
-    if gh api "${COMMON_HEADERS[@]}" \
-      --method DELETE \
-      "/enterprises/${enterprise}/settings/billing/cost-centers/${cost_center_id}/resource" \
-      --input - <<<"$payload" >/dev/null 2>&1; then
-      removed=$((removed + current_batch_size))
-      vlog "Successfully removed batch of $current_batch_size users"
-    else
-      failures=$((failures + current_batch_size))
-      echo "Failed to remove batch: ${batch[*]}" >&2
-    fi
-  done
-  
-  if [[ $removed -gt 0 ]]; then
-    echo "✓ Removed $removed users from cost center"
-  fi
-  
-  if [[ $failures -gt 0 ]]; then
-    echo "✗ Failed to remove $failures users" >&2
-    return 1
-  fi
-  
-  return 0
-}
-
-# Function to get organization team members
-get_org_team_members() {
-  local org="$1"
-  local team_slug="$2"
-  
-  vlog "Fetching organization team members for '$team_slug' in org '$org'..."
-  
-  local members_json
-  if members_json=$(gh api "${COMMON_HEADERS[@]}" \
-    "/orgs/${org}/teams/${team_slug}/members?per_page=100" \
-    --paginate 2>/dev/null); then
-    
-    # Extract usernames from the member objects
-    populate_array_from_command TEAM_USERS "echo '$members_json' | jq -r '.[].login // empty' | sort -u"
-    
-    if [[ ${#TEAM_USERS[@]} -eq 0 ]]; then
-      return 1
-    fi
-    
-    vlog "Found ${#TEAM_USERS[@]} team members"
-    return 0
-  else
-    return 1
-  fi
-}
-
-# Function to resolve organization team
-resolve_org_team() {
-  local org="$1"
-  local team_input="$2"
-  
-  vlog "Resolving organization team '$team_input' in org '$org'..."
-  
-  # First try to get the team directly by slug
-  if gh api "${COMMON_HEADERS[@]}" "/orgs/${org}/teams/${team_input}" >/dev/null 2>&1; then
-    echo "$team_input"
-    return 0
-  fi
-  
-  # If that fails, list all teams and look for name or slug match
-  local teams_json
-  if teams_json=$(gh api "${COMMON_HEADERS[@]}" \
-    "/orgs/${org}/teams?per_page=100" \
-    --paginate 2>/dev/null); then
-    
-    # Try to find team by exact name or slug match
-    local team_slug
-    team_slug=$(echo "$teams_json" | jq -r --arg q "$team_input" '
-      .[] | select((.slug==$q) or (.name==$q)) | .slug
-    ' | head -n1)
-    
-    if [[ -n "$team_slug" && "$team_slug" != "null" ]]; then
-      echo "$team_slug"
-      return 0
-    fi
-  fi
-  
-  return 1
-}
-
-# Function to get enterprise team members (existing logic)
-get_enterprise_team_members() {
-  local enterprise="$1"
-  local team_slug="$2"
-  
-  vlog "Fetching enterprise team members for '$team_slug'..."
-  
-  local members_json
-  if members_json=$(gh api "${COMMON_HEADERS[@]}" \
-    "/enterprises/${enterprise}/teams/${team_slug}/memberships?per_page=100" \
-    --paginate 2>/dev/null); then
-    
-    # Extract usernames from the member objects
-    populate_array_from_command TEAM_USERS "echo '$members_json' | jq -r '.[].login // empty' | sort -u"
-    
-    if [[ ${#TEAM_USERS[@]} -eq 0 ]]; then
-      return 1
-    fi
-    
-    vlog "Found ${#TEAM_USERS[@]} team members"
-    return 0
-  else
-    return 1
-  fi
-}
-
-# Function to resolve enterprise team (existing logic)
-resolve_enterprise_team() {
-  local enterprise="$1"
-  local team_input="$2"
-  
-  vlog "Resolving enterprise team '$team_input'..."
-  
-  local teams_json
-  if teams_json=$(gh api "${COMMON_HEADERS[@]}" \
-    "/enterprises/${enterprise}/teams?per_page=100" \
-    --paginate 2>/dev/null); then
-    
-    # Try to find team by exact name or slug match
-    local team_slug
-    team_slug=$(echo "$teams_json" | jq -r --arg q "$team_input" '
-      .[] | select((.slug==$q) or (.name==$q)) | .slug
-    ' | head -n1)
-
-    if [[ -n "$team_slug" && "$team_slug" != "null" ]]; then
-      echo "$team_slug"
-      return 0
-    fi
-  fi
-  
-  # Fallback: treat input as slug directly and test if it exists
-  if gh api "${COMMON_HEADERS[@]}" "/enterprises/${enterprise}/teams/${team_input}" >/dev/null 2>&1; then
-    echo "$team_input"
-    return 0
-  fi
-  
-  return 1
-}
-
-# Parse arguments
-ENTERPRISE=""
-ORG=""
-TEAM_INPUT=""
-CC_NAME=""
-CC_ID=""
-DRY_RUN=""
-YES=""
-VERBOSE=""
-CREATE_CC=""
-FORCE=""
-SYNC=""
-
-cmd_add_team() {
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -e|--enterprise) ENTERPRISE="$2"; shift 2;;
-      --org) ORG="$2"; shift 2;;
-      -t|--team) TEAM_INPUT="$2"; shift 2;;
-      -c|--cost-center) CC_NAME="$2"; shift 2;;
-      --cost-center-id) CC_ID="$2"; shift 2;;
-      --create-cost-center) CREATE_CC="1"; shift;;
-      --sync) SYNC="1"; shift;;
-      --dry-run) DRY_RUN="1"; shift;;
-      -y|--yes) YES="1"; shift;;
-      --force) FORCE="1"; YES="1"; CREATE_CC="1"; shift;;
-      --verbose) VERBOSE="1"; shift;;
-      -h|--help) usage; exit 0;;
-      *) die "Unknown flag: $1";;
-    esac
-  done
-
-  # Validate required arguments
-  [[ -z "$ENTERPRISE" ]] && die "Enterprise slug is required (-e/--enterprise)"
-  [[ -z "$TEAM_INPUT" ]] && die "Team name is required (-t/--team)"
-  [[ -z "$CC_NAME" && -z "$CC_ID" ]] && die "Cost center name (-c/--cost-center) or ID (--cost-center-id) is required"
-
-  # Check if gh is authenticated
-  if ! gh auth status >/dev/null 2>&1; then
-    die "Not authenticated with GitHub. Run 'gh auth login' first."
-  fi
-
-  if [[ -n "$FORCE" ]]; then
-    log "Starting in FORCE mode - will auto-create cost centers and skip confirmations..."
-  else
-    if [[ -n "$ORG" ]]; then
-      log "Starting to add organization team '$TEAM_INPUT' members from org '$ORG' to cost center..."
-    else
-      log "Starting to add enterprise team '$TEAM_INPUT' members to cost center..."
-    fi
-  fi
-
-  # Step 1: Resolve cost center ID if only name provided
-  if [[ -z "$CC_ID" ]]; then
-    vlog "Fetching cost centers for enterprise '$ENTERPRISE'..."
-    
-    COST_CENTERS_JSON=$(gh api "${COMMON_HEADERS[@]}" \
-      "/enterprises/${ENTERPRISE}/settings/billing/cost-centers" \
-      --paginate 2>/dev/null || die "Failed to fetch cost centers. Check enterprise permissions and name.")
-    
-    # Parse the costCenters array from the response
-    CC_ID=$(echo "$COST_CENTERS_JSON" | jq -r --arg name "$CC_NAME" '.costCenters[]? | select(.name==$name) | .id' | head -n1)
-    
-    if [[ -z "$CC_ID" || "$CC_ID" == "null" ]]; then
-      if [[ -n "$CREATE_CC" ]]; then
-        # Cost center not found, but we're allowed to create it
-        echo ""
-        echo "Cost center '$CC_NAME' not found in enterprise '$ENTERPRISE'."
-        
-        if [[ -n "$DRY_RUN" ]]; then
-          echo "[DRY RUN] Would create cost center '$CC_NAME'"
-          CC_ID="dry-run-cc-id"
-        else
-          echo ""
-          if [[ -n "$FORCE" ]]; then
-            echo "Force mode: Creating cost center '$CC_NAME'..."
-            vlog "Creating cost center '$CC_NAME'..."
-          elif confirm "Create new cost center '$CC_NAME'?"; then
-            vlog "Creating cost center '$CC_NAME'..."
-          else
-            die "Cost center creation cancelled. Cannot proceed without a cost center."
-          fi
-          
-          if CC_ID=$(create_cost_center "$ENTERPRISE" "$CC_NAME"); then
-            echo "✓ Created cost center '$CC_NAME' with ID: $CC_ID"
-            vlog "Successfully created cost center '$CC_NAME' -> ID $CC_ID"
-          else
-            die "Failed to create cost center '$CC_NAME'. Check permissions and try again."
-          fi
-        fi
-      else
-        echo ""
-        echo "Cost center '$CC_NAME' not found in enterprise '$ENTERPRISE'."
-        echo "Available options:"
-        echo "1. Use an existing cost center name"
-        echo "2. Add --create-cost-center flag to create it automatically"
-        echo "3. Add --force flag to auto-create and skip confirmations"
-        echo "4. Use --cost-center-id with an existing cost center ID"
-        die "Cost center not found. See options above."
-      fi
-    else
-      vlog "Resolved cost center '$CC_NAME' -> ID $CC_ID"
-    fi
-  else
-    vlog "Using provided cost center ID: $CC_ID"
-  fi
-
-  # Step 2: Resolve team slug/ID and fetch members
-  if [[ -n "$ORG" ]]; then
-    # Organization team flow
-    vlog "Using organization teams from org '$ORG'..."
-    
-    if TEAM_SLUG=$(resolve_org_team "$ORG" "$TEAM_INPUT"); then
-      vlog "Resolved organization team '$TEAM_INPUT' -> slug '$TEAM_SLUG'"
-    else
-      die "Organization team '$TEAM_INPUT' not found in org '$ORG'. Check the team name or slug and organization permissions."
-    fi
-    
-    if ! get_org_team_members "$ORG" "$TEAM_SLUG"; then
-      die "Failed to fetch members for organization team '$TEAM_SLUG'. Check team slug and permissions."
-    fi
-  else
-    # Enterprise team flow (existing logic)
-    vlog "Using enterprise teams..."
-    
-    if TEAM_SLUG=$(resolve_enterprise_team "$ENTERPRISE" "$TEAM_INPUT"); then
-      vlog "Resolved enterprise team '$TEAM_INPUT' -> slug '$TEAM_SLUG'"
-    else
-      die "Enterprise team '$TEAM_INPUT' not found in enterprise '$ENTERPRISE'. Check the team name or slug and enterprise permissions."
-    fi
-    
-    if ! get_enterprise_team_members "$ENTERPRISE" "$TEAM_SLUG"; then
-      die "Failed to fetch members for enterprise team '$TEAM_SLUG'. Check team slug and permissions."
-    fi
-  fi
-
-  [[ ${#TEAM_USERS[@]} -eq 0 ]] && die "No members found for team '$TEAM_SLUG'."
-
-  # Step 3: Get current cost center users to avoid duplicates
-  vlog "Fetching current cost center users..."
-  
-  if [[ -n "$DRY_RUN" && "$CC_ID" == "dry-run-cc-id" ]]; then
-    # In dry-run mode with a new cost center, assume no existing users
-    vlog "Dry-run mode with new cost center - assuming no existing users"
-    CC_USERS=()
-  else
-    CC_DETAILS_JSON=$(gh api "${COMMON_HEADERS[@]}" \
-      "/enterprises/${ENTERPRISE}/settings/billing/cost-centers/${CC_ID}" \
-      2>/dev/null || die "Failed to fetch cost center details. Check cost center ID and permissions.")
-    
-    # Extract current users from the resources array - handle different JSON structures
-    populate_array_from_command CC_USERS "echo '$CC_DETAILS_JSON' | jq -r 'if type == \"array\" then .[].resources[]? else .resources[]? end | select(.type==\"User\") | .name // empty' | sort -u"
-  fi
-  
-  # Step 4: Compute users to add (those not already in cost center)
-  TO_ADD=()
-  if [[ ${#CC_USERS[@]} -gt 0 ]]; then
-    CC_SET=$(printf "%s\n" "${CC_USERS[@]}" | sort -u)
-    for user in "${TEAM_USERS[@]}"; do
-      if ! echo "$CC_SET" | grep -qxF "$user"; then
-        TO_ADD+=("$user")
-      fi
-    done
-  else
-    TO_ADD=("${TEAM_USERS[@]}")
-  fi
-
-  # Step 5: Display summary and confirm
-  echo ""
-  echo "Summary:"
-  echo "  Enterprise: $ENTERPRISE"
-  if [[ -n "$ORG" ]]; then
-    echo "  Organization: $ORG"
-    echo "  Team: $TEAM_INPUT ($TEAM_SLUG) [org team]"
-  else
-    echo "  Team: $TEAM_INPUT ($TEAM_SLUG) [enterprise team]"
-  fi
-  if [[ "$CC_ID" == "dry-run-cc-id" ]]; then
-    echo "  Cost Center: $CC_NAME (would be created)"
-  else
-    echo "  Cost Center: $CC_NAME ($CC_ID)"
-  fi
-  echo "  Team members: ${#TEAM_USERS[@]}"
-  echo "  Already in cost center: $((${#TEAM_USERS[@]} - ${#TO_ADD[@]}))"
-  echo "  To add: ${#TO_ADD[@]}"
-  
-  if [[ ${#TO_ADD[@]} -eq 0 ]]; then
-    echo ""
-    echo "✓ All team members are already in the cost center."
-    
-    # Skip adding users but continue to sync if requested
-    if [[ "$SYNC" != "1" ]]; then
-      echo "Nothing to do."
-      exit 0
-    fi
-  else
-    echo ""
-    echo "Users to add:"
-    printf "  %s\n" "${TO_ADD[@]}"
-
-    if [[ -n "$DRY_RUN" ]]; then
-      echo ""
-      if [[ "$CC_ID" == "dry-run-cc-id" ]]; then
-        echo "[DRY RUN] Would create cost center '$CC_NAME' and add ${#TO_ADD[@]} users to it."
-      else
-        echo "[DRY RUN] Would add ${#TO_ADD[@]} users to cost center."
-      fi
-      
-      # Continue to sync if requested, even in dry-run mode
-      if [[ "$SYNC" != "1" ]]; then
-        echo "No changes made."
-        exit 0
-      fi
-    else
-      echo ""
-      if [[ "$CC_ID" == "dry-run-cc-id" ]]; then
-        die "Error: Cost center ID is invalid for actual execution. This should not happen."
-      fi
-      
-      if ! confirm "Proceed to add ${#TO_ADD[@]} users to cost center '$CC_ID'?"; then
-        echo "Operation cancelled."
-        exit 0
-      fi
-
-      # Step 6: Add users to cost center
-      log "Adding users to cost center..."
-      
-      # The API accepts up to 50 resources per request, so we'll batch if needed
-      BATCH_SIZE=50
-      added=0
-      failures=0
-      
-      for ((i=0; i<${#TO_ADD[@]}; i+=BATCH_SIZE)); do
-      # Get batch of users
-      batch=("${TO_ADD[@]:i:BATCH_SIZE}")
-      batch_size=${#batch[@]}
-      
-      vlog "Adding batch of $batch_size users: ${batch[*]}"
-      
-      # Create JSON payload for this batch
-      payload=$(printf '%s\n' "${batch[@]}" | jq -R . | jq -s '{users: .}')
-      
-      if gh api "${COMMON_HEADERS[@]}" \
-        --method POST \
-        "/enterprises/${ENTERPRISE}/settings/billing/cost-centers/${CC_ID}/resource" \
-        --input - <<<"$payload" >/dev/null 2>&1; then
-        added=$((added + batch_size))
-        vlog "Successfully added batch of $batch_size users"
-      else
-        failures=$((failures + batch_size))
-        echo "Failed to add batch: ${batch[*]}" >&2
-      fi
-    done
-
-    # Step 7: Report results
-    echo ""
-    if [[ $added -gt 0 ]]; then
-      echo "✓ Successfully added $added users to cost center '$CC_ID'"
-    fi
-    
-    if [[ $failures -gt 0 ]]; then
-      echo "✗ Failed to add $failures users" >&2
-      exit 2
-    fi
-    fi
-  fi
-
-  # Step 8: Sync functionality - remove users not in team
-  if [[ "$SYNC" == "1" ]]; then
-    echo ""
-    echo "=== Synchronizing cost center membership ==="
-    
-    # Get current cost center users (reuse the already fetched data)
-    vlog "Getting current cost center users..."
-    if [[ "$CC_ID" == "dry-run-cc-id" ]]; then
-      SYNC_CC_USERS=()
-      vlog "Dry-run mode - assuming no existing users for sync"
-    else
-      # Reuse the CC_DETAILS_JSON that was already fetched
-      populate_array_from_command SYNC_CC_USERS "echo '$CC_DETAILS_JSON' | jq -r 'if type == \"array\" then .[].resources[]? else .resources[]? end | select(.type==\"User\") | .name // empty' | sort -u"
-    fi
-    
-    if [[ ${#SYNC_CC_USERS[@]} -eq 0 ]]; then
-      echo "✓ Cost center has no users to sync"
-    else
-      echo "Found ${#SYNC_CC_USERS[@]} users in cost center: ${SYNC_CC_USERS[*]}"
-      
-      # Find users to remove (in cost center but not in team)
-      TO_REMOVE=()
-      for cc_user in "${SYNC_CC_USERS[@]}"; do
-        found=false
-        for team_user in "${TEAM_USERS[@]}"; do
-          if [[ "$cc_user" == "$team_user" ]]; then
-            found=true
-            break
-          fi
-        done
-        if [[ "$found" == "false" ]]; then
-          TO_REMOVE+=("$cc_user")
-        fi
-      done
-      
-      if [[ ${#TO_REMOVE[@]} -eq 0 ]]; then
-        echo "✓ No users need to be removed - cost center is already synchronized"
-      else
-        echo "Found ${#TO_REMOVE[@]} users to remove: ${TO_REMOVE[*]}"
-        
-        if [[ -n "$DRY_RUN" ]]; then
-          echo ""
-          echo "[DRY RUN] Would remove ${#TO_REMOVE[@]} users from cost center. No changes made."
-          echo "Users that would be removed:"
-          printf "  - %s\n" "${TO_REMOVE[@]}"
-        else
-          if [[ "$FORCE" != "1" ]]; then
-            echo ""
-            echo "These users will be REMOVED from cost center '$CC_NAME':"
-            printf "  - %s\n" "${TO_REMOVE[@]}"
-            echo ""
-            if ! confirm "Continue with removal?"; then
-              echo "Removal cancelled."
-              exit 0
-            fi
-          fi
-          
-          if ! remove_users_from_cost_center "$ENTERPRISE" "$CC_ID" "${TO_REMOVE[@]}"; then
-            echo "Failed to remove users from cost center" >&2
-            exit 1
-          fi
-        fi
-      fi
-    fi
-  fi
-  
-  echo ""
-  echo "Operation completed successfully!"
-  exit 0
-}
-
+# Main command execution
 main() {
-  sub="${1:-}"
-  if [[ $# -gt 0 ]]; then shift; fi
-  
-  case "$sub" in
-    add-team) cmd_add_team "$@";;
-    -h|--help|help|"") usage; exit 0;;
-    *) die "Unknown subcommand: $sub. Use 'gh cost-center --help' for usage.";;
-  esac
+    # Parse and validate arguments
+    parse_args "$@"
+    validate_args
+
+    # Start execution
+    if [[ -n "${DRY_RUN:-}" ]]; then
+        log "Running in DRY-RUN mode - no changes will be made"
+    fi
+
+    log "Starting cost center management..."
+    vlog "Enterprise: $ENTERPRISE"
+    vlog "Team: $TEAM_INPUT"
+    vlog "Cost Center: ${COST_CENTER_NAME:-$COST_CENTER_ID}"
+
+    # Resolve team and get members
+    resolve_team "$TEAM_INPUT"
+    validate_team
+
+    local -a team_members=()
+    while IFS= read -r member; do
+        [[ -n "$member" ]] && team_members+=("$member")
+    done < <(get_team_members)
+
+    if [[ ${#team_members[@]} -eq 0 ]]; then
+        if [[ -z "${SYNC:-}" ]]; then
+            die "No members found in team '$TEAM_SLUG'. Use --sync to remove all users from cost center."
+        else
+            log "No members found in team '$TEAM_SLUG' - will remove all users from cost center (sync mode)"
+        fi
+    else
+        log "Found ${#team_members[@]} members in team"
+        vlog "Team members: ${team_members[*]}"
+    fi
+
+    # Resolve cost center
+    resolve_cost_center
+
+    # Get current cost center users for sync logic
+    local -a current_cc_users=()
+    while IFS= read -r user; do
+        [[ -n "$user" ]] && current_cc_users+=("$user")
+    done < <(get_current_cost_center_users)
+
+    # Compute users to add and remove
+    local -a users_to_add=()
+    local -a users_to_remove=()
+
+    # Find users to add (team members not in cost center)
+    if [[ ${#team_members[@]} -gt 0 ]]; then
+        local team_set
+        team_set="$(printf '%s\n' "${team_members[@]}" | sort -u)"
+
+        local cc_set=""
+        if [[ ${#current_cc_users[@]} -gt 0 ]]; then
+            cc_set="$(printf '%s\n' "${current_cc_users[@]}" | sort -u)"
+        fi
+
+        while IFS= read -r user; do
+            [[ -n "$user" ]] || continue
+            if [[ -z "$cc_set" ]] || ! grep -qxF "$user" <<<"$cc_set"; then
+                users_to_add+=("$user")
+            fi
+        done <<<"$team_set"
+    fi
+
+    # Find users to remove (cost center users not in team) - only if sync mode
+    if [[ -n "${SYNC:-}" && ${#current_cc_users[@]} -gt 0 ]]; then
+        local team_set=""
+        if [[ ${#team_members[@]} -gt 0 ]]; then
+            team_set="$(printf '%s\n' "${team_members[@]}" | sort -u)"
+        fi
+
+        local cc_set
+        cc_set="$(printf '%s\n' "${current_cc_users[@]}" | sort -u)"
+
+        while IFS= read -r user; do
+            [[ -n "$user" ]] || continue
+            if [[ -z "$team_set" ]] || ! grep -qxF "$user" <<<"$team_set"; then
+                users_to_remove+=("$user")
+            fi
+        done <<<"$cc_set"
+    fi
+
+    # Report planned actions
+    if [[ ${#users_to_add[@]} -gt 0 ]]; then
+        log "Will add ${#users_to_add[@]} users to cost center"
+        vlog "Users to add: ${users_to_add[*]}"
+    else
+        log "No users need to be added to cost center"
+    fi
+
+    if [[ -n "${SYNC:-}" ]]; then
+        if [[ ${#users_to_remove[@]} -gt 0 ]]; then
+            log "Will remove ${#users_to_remove[@]} users from cost center (sync mode)"
+            vlog "Users to remove: ${users_to_remove[*]}"
+        else
+            log "No users need to be removed from cost center (sync mode)"
+        fi
+    fi
+
+    # Execute changes
+    if [[ ${#users_to_add[@]} -gt 0 ]]; then
+        add_users_to_cost_center_batch "${users_to_add[@]}"
+    else
+        add_users_to_cost_center_batch
+    fi
+
+    if [[ -n "${SYNC:-}" ]]; then
+        if [[ ${#users_to_remove[@]} -gt 0 ]]; then
+            remove_users_from_cost_center_batch "${users_to_remove[@]}"
+        else
+            remove_users_from_cost_center_batch
+        fi
+    fi
+
+    # Final summary
+    local actions_taken=0
+    [[ ${#users_to_add[@]} -gt 0 ]] && ((actions_taken += ${#users_to_add[@]}))
+    if [[ -n "${SYNC:-}" && ${#users_to_remove[@]} -gt 0 ]]; then
+        ((actions_taken += ${#users_to_remove[@]}))
+    fi
+
+    if [[ -n "${DRY_RUN:-}" ]]; then
+        log "Dry-run completed. Would have modified $actions_taken user assignments"
+    else
+        log "Successfully completed cost center management. Modified $actions_taken user assignments"
+    fi
 }
 
+# Error handling wrapper
 main "$@"
