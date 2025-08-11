@@ -35,16 +35,15 @@ gh extension install .
 ## Prerequisites
 
 ### Requirements
-- GitHub Enterprise Cloud account
-- Access to Cost Centers (Enhanced billing platform)
-- Enterprise admin permissions for billing management
-- For **Enterprise Teams**: Early access to Enterprise Teams API
+- GitHub Enterprise Cloud with Cost Centers enabled
+- For **Enterprise Teams**: Enterprise admin permissions and early access to Enterprise Teams API
 - For **Organization Teams**: Organization member permissions with `read:org` scope
+- Personal access token with `manage_billing:enterprise` scope
 - GitHub CLI authenticated with appropriate permissions
 
 ### Authentication
 Your GitHub CLI must be authenticated with a token that has:
-- `manage_billing:enterprise` scope
+- `manage_billing:enterprise` scope (required for cost center management)
 - For Enterprise Teams: Enterprise admin permissions
 - For Organization Teams: `read:org` scope
 
@@ -79,7 +78,7 @@ gh cost-center add-team [options]
 
 Required:
   -e, --enterprise         Enterprise slug
-  -t, --team              Team name or slug
+  -t, --team              Enterprise Team name or Org Team Name (if used with --org)
   -c, --cost-center       Cost center name
       --cost-center-id    Cost center ID (alternative to --cost-center)
 
