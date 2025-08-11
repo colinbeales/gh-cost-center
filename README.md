@@ -59,7 +59,7 @@ gh auth login
 
 ### Basic Usage
 
-Add all members of an enterprise team to a cost center:
+Add all members of a team to a cost center:
 
 ```bash
 gh cost-center add-team -e myenterprise -t "Engineering Team" -c "Engineering Cost Center"
@@ -142,8 +142,8 @@ gh cost-center add-team -e myenterprise --org myorg -t "security" -c "Security B
 
 ## How It Works
 
-1. **Team Resolution**: Finds the enterprise team by name or slug
-2. **Member Retrieval**: Gets all members of the specified team
+1. **Team Resolution**: Finds the team by name or slug (enterprise team or organization team)
+2. **Member Retrieval**: Gets all members of the specified team using appropriate API
 3. **Cost Center Resolution**: Finds the cost center by name or uses provided ID
 4. **Cost Center Creation**: Optionally creates cost center if it doesn't exist (with `--create-cost-center` or `--force`)
 5. **Duplicate Check**: Identifies team members not already in the cost center
@@ -153,7 +153,7 @@ gh cost-center add-team -e myenterprise --org myorg -t "security" -c "Security B
 
 ## Sync Functionality
 
-The `--sync` flag provides bidirectional synchronization between enterprise teams and cost centers:
+The `--sync` flag provides bidirectional synchronization between teams and cost centers:
 
 ### What Sync Does
 - **Adds missing users**: Team members not in the cost center are added
@@ -185,12 +185,17 @@ gh cost-center add-team -e myenterprise -t "DevOps Team" -c "Infrastructure" --s
 
 ## API Endpoints Used
 
-This extension uses the following GitHub Enterprise APIs:
+This extension uses the following GitHub APIs:
 
 ### Enterprise Teams API (Early Access)
 - `GET /enterprises/{enterprise}/teams` - List enterprise teams
-- `GET /enterprises/{enterprise}/teams/{team_slug}` - Get team details
-- `GET /enterprises/{enterprise}/teams/{team_slug}/memberships` - List team members
+- `GET /enterprises/{enterprise}/teams/{team_slug}` - Get enterprise team details
+- `GET /enterprises/{enterprise}/teams/{team_slug}/memberships` - List enterprise team members
+
+### Organization Teams API (Standard)
+- `GET /orgs/{org}/teams` - List organization teams
+- `GET /orgs/{org}/teams/{team_slug}` - Get organization team details  
+- `GET /orgs/{org}/teams/{team_slug}/members` - List organization team members
 
 ### Enterprise Billing API
 - `GET /enterprises/{enterprise}/settings/billing/cost-centers` - List cost centers
@@ -198,6 +203,7 @@ This extension uses the following GitHub Enterprise APIs:
 - `GET /enterprises/{enterprise}/settings/billing/cost-centers/{id}/resource` - Get cost center users
 - `POST /enterprises/{enterprise}/settings/billing/cost-centers` - Create cost center
 - `POST /enterprises/{enterprise}/settings/billing/cost-centers/{id}/resource` - Add users to cost center
+- `DELETE /enterprises/{enterprise}/settings/billing/cost-centers/{id}/resource` - Remove users from cost center
 - `DELETE /enterprises/{enterprise}/settings/billing/cost-centers/{id}/resource` - Remove users from cost center
 
 ## Error Handling
@@ -308,9 +314,17 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## Changelog
 
+### v1.3.0
+- **Added GitHub Organization Teams support** with `--org` parameter
+- Support for both Enterprise Teams and Organization Teams
+- New Organization Teams API integration
+- Enhanced team resolution logic for dual team type support
+- Updated documentation and examples for organization teams
+- Improved error handling for different team types
+
 ### v1.2.0
 - **Added sync functionality** with `--sync` flag for bidirectional synchronization
-- Remove cost center users who are not in the enterprise team
+- Remove cost center users who are not in the team
 - Enhanced safety features with removal confirmations
 - Comprehensive sync documentation and examples
 - Fixed variable naming inconsistencies
@@ -325,7 +339,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ### v1.0.0
 - Initial release
-- Add enterprise team members to cost centers
+- Add team members to cost centers
 - Dry-run mode
 - Batch processing
 - Comprehensive error handling
