@@ -36,4 +36,4 @@ jobs:
       run: make test
     
     - name: Test help output
-      run: ./bin/gh-cost-center --help
+      run: ./gh-cost-center --help
