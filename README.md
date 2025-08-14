@@ -204,7 +204,7 @@ This extension uses the following GitHub APIs:
 - `POST /enterprises/{enterprise}/settings/billing/cost-centers` - Create cost center
 - `POST /enterprises/{enterprise}/settings/billing/cost-centers/{id}/resource` - Add users to cost center
 - `DELETE /enterprises/{enterprise}/settings/billing/cost-centers/{id}/resource` - Remove users from cost center
-- `DELETE /enterprises/{enterprise}/settings/billing/cost-centers/{id}/resource` - Remove users from cost center
+
 
 ## Error Handling
 
